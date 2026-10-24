@@ -1,0 +1,18 @@
+[Unit]
+Description=NEKRYPTA Quickshell desktop
+After=graphical-session.target
+PartOf=graphical-session.target
+StartLimitIntervalSec=60
+StartLimitBurst=4
+
+[Service]
+Type=simple
+# Once Hyprland has exited (logout) there is nothing to draw on: skip the start instead of crash-looping.
+ExecCondition=/bin/sh -c 'case "$${WAYLAND_DISPLAY:-}" in "") exit 1 ;; /*) socket="$$WAYLAND_DISPLAY" ;; *) socket="$${XDG_RUNTIME_DIR:-/run/user/$$(id -u)}/$$WAYLAND_DISPLAY" ;; esac; test -S "$$socket"'
+ExecStart=%h/.local/bin/nekrypta run
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=10
+
+[Install]
+WantedBy=graphical-session.target

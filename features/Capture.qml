@@ -1,0 +1,219 @@
+import QtQuick
+import QtQuick.Controls
+import QtQuick.Layouts
+import "../core"
+import "../components" as C
+import "../core/i18n.js" as I18n
+
+FocusScope {
+    id: root
+    readonly property string title: I18n.t("Capture")
+    readonly property int panelHeight: 540
+    property string mode: "region"
+    property string kind: ShellState.recording.active ? "recording" : "screenshot"
+    property bool copy: true
+    // wf-recorder takes one audio source, so system audio and the microphone are alternatives.
+    readonly property string audio: ShellState.setting("recordAudio", "none")
+    property bool pending: false
+    property string error: ""
+    // The first tool this capture needs that isn't installed; stopping a recording needs none.
+    readonly property string missingTool: {
+        if (kind === "recording" && ShellState.recording.active)
+            return "";
+        const needs = [kind === "screenshot" ? "grim" : "wf-recorder"].concat(mode === "region" ? ["slurp"] : []);
+        return needs.find(command => !Backend.has(command, true)) || "";
+    }
+    function capture() {
+        if (pending || !Backend.ready || missingTool)
+            return;
+        pending = true;
+        error = "";
+        if (kind === "screenshot") {
+            ShellState.screenshot(mode, copy);
+        } else if (!ShellState.recording.active) {
+            ShellState.record(mode, audio);
+        } else {
+            Backend.request("capture.record.stop", {}, (r, e) => {
+                pending = false;
+                if (e) {
+                    error = I18n.error(e) || I18n.t("Could not stop recording. Try again.");
+                    return;
+                }
+                ShellState.recording = r;
+                ShellState.refreshRecording();
+                ShellState.recordingResult(r);
+            });
+        }
+    }
+    ColumnLayout {
+        anchors.fill: parent
+        spacing: Theme.gapL
+        C.Segmented {
+            Layout.fillWidth: true
+            segmentHeight: Theme.controlLarge
+            enabled: !root.pending
+            model: [{key: "screenshot", text: I18n.t("Screenshot"), glyph: "camera"}, {key: "recording", text: I18n.t("Recording"), glyph: "record"}]
+            current: root.kind
+            onActivated: key => { root.kind = key; root.error = ""; }
+        }
+        ScrollView {
+            id: scroll
+            ScrollBar.vertical: C.ScrollBar {
+                parent: scroll
+                x: scroll.width - width
+                y: scroll.topPadding
+                height: scroll.availableHeight
+            }
+            Layout.fillWidth: true
+            Layout.fillHeight: true
+            contentWidth: availableWidth
+            clip: true
+            ColumnLayout {
+                width: scroll.availableWidth
+                spacing: Theme.gapL
+                C.SectionHeader {
+                    text: root.kind === "recording" && ShellState.recording.active ? I18n.t("Recording area") : I18n.t("Capture area")
+                }
+                C.Segmented {
+                    Layout.fillWidth: true
+                    Layout.topMargin: -Theme.gapS
+                    segmentHeight: Theme.controlLarge
+                    enabled: !root.pending && !(root.kind === "recording" && ShellState.recording.active)
+                    model: [{key: "region", text: I18n.t("Region"), glyph: "region"}, {key: "output", text: I18n.t("Display"), glyph: "monitor"}, {key: "window", text: I18n.t("Window"), glyph: "window"}]
+                    current: root.mode
+                    onActivated: key => root.mode = key
+                }
+                RowLayout {
+                    visible: root.kind === "screenshot"
+                    Layout.fillWidth: true
+                    spacing: Theme.gapM
+                    C.Label {
+                        text: I18n.t("Delay")
+                        Layout.fillWidth: true
+                    }
+                    C.Segmented {
+                        fill: false
+                        Layout.preferredWidth: 240
+                        enabled: !root.pending
+                        model: [0, 3, 5, 10].map(seconds => ({key: seconds, text: seconds === 0 ? I18n.t("None") : seconds + "s"}))
+                        current: ShellState.setting("captureDelay", 0)
+                        onActivated: key => ShellState.setSetting("captureDelay", key)
+                    }
+                }
+                C.Toggle {
+                    visible: root.kind === "screenshot"
+                    Layout.fillWidth: true
+                    text: I18n.t("Copy to clipboard")
+                    selected: root.copy
+                    enabled: !root.pending
+                    onClicked: root.copy = !root.copy
+                }
+                RowLayout {
+                    visible: root.kind === "recording"
+                    Layout.fillWidth: true
+                    spacing: Theme.gapM
+                    C.Label {
+                        text: I18n.t("Audio")
+                        Layout.fillWidth: true
+                    }
+                    C.Segmented {
+                        fill: false
+                        Layout.preferredWidth: 300
+                        enabled: !root.pending && !ShellState.recording.active
+                        model: [{key: "none", text: I18n.t("None"), accessibleName: I18n.t("No audio")}, {key: "system", text: I18n.t("System"), accessibleName: I18n.t("System audio")}, {key: "microphone", text: I18n.t("Microphone")}]
+                        current: root.audio
+                        onActivated: key => ShellState.setSetting("recordAudio", key)
+                    }
+                }
+                C.Label {
+                    visible: root.kind === "recording"
+                    text: I18n.t("One source at a time: what your speakers play, or your microphone.")
+                    color: Theme.muted
+                    font.pixelSize: Theme.small
+                    wrapMode: Text.WordWrap
+                    Layout.fillWidth: true
+                    Layout.topMargin: -Theme.gapS
+                }
+                RowLayout {
+                    visible: root.kind === "recording" && ShellState.recording.active
+                    Layout.fillWidth: true
+                    spacing: Theme.gapS
+                    Rectangle {
+                        Layout.preferredWidth: 7
+                        Layout.preferredHeight: 7
+                        radius: 3.5
+                        color: Theme.danger
+                        SequentialAnimation on opacity {
+                            running: !Theme.reduced && root.kind === "recording" && ShellState.recording.active
+                            loops: Animation.Infinite
+                            NumberAnimation { to: 0.45; duration: 800; easing.type: Easing.InOutSine }
+                            NumberAnimation { to: 1; duration: 800; easing.type: Easing.InOutSine }
+                        }
+                    }
+                    C.Label {
+                        text: I18n.t("Recording in progress")
+                        color: Theme.danger
+                        font.weight: Font.DemiBold
+                        Layout.fillWidth: true
+                    }
+                }
+                C.Card {
+                    Layout.fillWidth: true
+                    implicitHeight: destination.implicitHeight + 2 * Theme.gapL
+                    ColumnLayout {
+                        id: destination
+                        anchors.fill: parent
+                        anchors.margins: Theme.gapL
+                        spacing: Theme.gapXs
+                        C.Caption {
+                            text: I18n.t("Save location")
+                            Layout.fillWidth: true
+                        }
+                        C.Label {
+                            text: root.kind === "screenshot" ? ShellState.setting("screenshotDirectory", "~/Pictures/Screenshots") : ShellState.recording.active ? (ShellState.recording.path || I18n.t("Preparing recording…")) : ShellState.setting("recordingDirectory", "~/Videos/Recordings")
+                            font.pixelSize: Theme.small
+                            font.family: Theme.mono
+                            Layout.fillWidth: true
+                            maximumLineCount: 3
+                            wrapMode: Text.WrapAnywhere
+                        }
+                    }
+                }
+                C.Label {
+                    visible: root.error !== ""
+                    text: root.error
+                    color: Theme.danger
+                    Layout.fillWidth: true
+                    wrapMode: Text.WordWrap
+                }
+            }
+        }
+        RowLayout {
+            Layout.fillWidth: true
+            spacing: Theme.gapS
+            C.Button {
+                visible: Backend.has("hyprpicker", true)
+                text: I18n.t("Pick color")
+                flat: true
+                glyph: "palette"
+                enabled: !root.pending && Backend.ready
+                implicitHeight: Theme.controlLarge
+                onClicked: {
+                    root.pending = true;
+                    ShellState.action("color");
+                }
+            }
+            C.Button {
+                text: root.missingTool ? I18n.t("Install ") + root.missingTool + I18n.t(" to ") + (root.kind === "screenshot" ? I18n.t("take screenshots") : "record")
+                    : root.pending ? I18n.t("Working…") : root.kind === "screenshot" ? I18n.t("Take screenshot") : ShellState.recording.active ? I18n.t("Stop recording") : I18n.t("Start recording")
+                accent: !(root.kind === "recording" && ShellState.recording.active)
+                danger: root.kind === "recording" && ShellState.recording.active
+                glyph: root.kind === "screenshot" ? "camera" : ShellState.recording.active ? "stop" : "record"
+                Layout.fillWidth: true
+                implicitHeight: Theme.controlLarge
+                enabled: !root.pending && Backend.ready && !root.missingTool
+                onClicked: root.capture()
+            }
+        }
+    }
+}

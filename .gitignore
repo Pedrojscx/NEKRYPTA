@@ -1,0 +1,89 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+*.egg-info/
+
+# Quickshell and logs
+*.qslog
+*.log
+
+# Temporary files, backups and editor leftovers
+*.tmp
+*.temp
+*.bak
+*.bak.*
+*.backup
+*.orig
+*.rej
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Installed dependencies and generated builds
+node_modules/
+dist/
+build/
+out/
+
+# Personal files and secrets
+.env
+.env.*
+*.pem
+*.key
+*.sqlite3
+security-session.json
+state.json
+
+# Local state, snapshots and generated QA output never belong in the repository.
+qa-output/
+
+# Screenshots are ignored except the ones under docs/
+*.png
+!docs/**/*.png
+
+# Local AI tooling: agent settings, memories, histories, sessions, caches, indexes and logs
+.claude/
+.claude.json
+CLAUDE.md
+CLAUDE.local.md
+.agents/
+AGENTS.md
+.codex/
+.gemini/
+GEMINI.md
+.cursor/
+.cursorrules
+.windsurf/
+.windsurfrules
+.aider*
+.continue/
+.cline/
+.clinerules
+.roo/
+.roomodes
+.opencode/
+.copilot/
+.github/copilot-instructions.md
+.mcp.json
+.maestri/
+.serena/
+.superpowers/
+.specstory/
+.omc/
+.codegraph/
+
+# graphify: knowledge-graph cache, index and outputs
+graphify-out/
+.graphify*

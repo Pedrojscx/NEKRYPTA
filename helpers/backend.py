@@ -1,0 +1,2103 @@
+#!/usr/bin/env python3
+"""NEKRYPTA JSON-lines backend. Credentials and clipboard data never enter logs."""
+import ast
+import asyncio
+import datetime
+import importlib.util
+import json
+import math
+import operator
+import os
+from pathlib import Path
+import re
+import select
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+import traceback
+from urllib.parse import unquote, urlsplit
+import wallpaper
+import wallhaven
+import wallpaperscom
+import art
+import sysmon
+from runtime import runtime_base
+import bluetooth_keep
+import clipboard_watch
+import equalizer
+import weather
+import units
+import personal
+import mullvad
+import exposure
+import visualizer
+import security
+
+def user_dir(name, fallback, home=None):
+    """An XDG user directory such as PICTURES from user-dirs.dirs (localized, e.g. ~/Bilder), as ~/path."""
+    home = home or Path.home()
+    config = Path(os.environ.get("XDG_CONFIG_HOME") or home / ".config") / "user-dirs.dirs"
+    try:
+        lines = config.read_text().splitlines()
+    except OSError:
+        return fallback
+    for line in lines:
+        match = re.fullmatch(rf'XDG_{name}_DIR="(.*)"', line.strip())
+        if not match:
+            continue
+        path = Path(match[1].replace("$HOME", str(home)))
+        if not path.is_absolute() or path == home:
+            return fallback  # xdg-user-dirs points a disabled directory at $HOME itself
+        return "~/" + str(path.relative_to(home)) if path.is_relative_to(home) else str(path)
+    return fallback
+
+# Operational state only: what the user does while the shell runs. Everything about how it looks and behaves is
+# fixed in core/personal.json (helpers/personal.py) and cannot be changed through the helper.
+OPERATIONAL = {"pinnedApps": [], "appUsage": {}, "emojiUsage": {}, "bluetoothAutoConnect": [], "eqBands": [0] * len(equalizer.BANDS),
+               "focusSession": {}, "timers": [], **personal.INITIAL}
+assert set(OPERATIONAL) == set(personal.OPERATIONAL_KEYS)
+DEFAULTS = {"version": 1, **OPERATIONAL, **personal.FIXED}
+_STATE_HOME = Path(os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local/state")))
+STATE = _STATE_HOME / "nekrypta"
+CONFIG = STATE / "state.json"
+RUNTIME = runtime_base() / "nekrypta"
+CACHE = Path(os.environ.get("XDG_CACHE_HOME", str(Path.home() / ".cache"))) / "nekrypta"
+# The command the Hyprland shortcuts and the lock screen run.
+NEKRYPTA_COMMAND = str(Path.home() / ".local/bin/nekrypta")
+
+BUILTIN_PANEL = re.compile(r"(eDP|LVDS|DSI)-[A-Za-z0-9-]+")
+SEARCH_ENGINES = ("duckduckgo", "google", "brave")
+# wf-recorder records one PulseAudio source. Given none it takes the default source, the microphone,
+# so system audio names the default output's monitor.
+RECORD_AUDIO = {"none": None, "system": "@DEFAULT_MONITOR@", "microphone": "@DEFAULT_SOURCE@"}
+STABLE_ERROR_CODES = (
+    "invalid", "failed", "timeout", "unavailable", "cancelled", "permission", "authentication",
+            "busy", "cli_missing", "daemon_down", "daemon_unavailable", "logged_out", "incompatible", "not_logged_in", "version_unsupported", "manual", "weather", "secret_agent_required", "tailscale_exception",
+    "dependency_missing", "process_failed", "restart_limited",
+)
+
+def keyboard_state(devices):
+    """The layouts of the main keyboard from `hyprctl devices -j`: {layouts: [{code, variant}], index, name}."""
+    keyboards = [k for k in devices.get("keyboards", []) if isinstance(k, dict)] if isinstance(devices, dict) else []
+    keyboard = next((k for k in keyboards if k.get("main")), keyboards[0] if keyboards else None)
+    if keyboard is None:
+        return {"layouts": [], "index": 0, "name": ""}
+    codes = [code.strip() for code in str(keyboard.get("layout", "")).split(",")]
+    variants = str(keyboard.get("variant", "")).split(",")
+    layouts = [{"code": code, "variant": variants[i].strip() if i < len(variants) else ""} for i, code in enumerate(codes) if code]
+    index = keyboard.get("active_layout_index", 0)
+    return {"layouts": layouts, "index": index if type(index) is int and 0 <= index < len(layouts) else 0,
+            "name": str(keyboard.get("active_keymap", ""))}
+
+def file_search_args(query, home):
+    """fd arguments for a launcher file search: every word must appear in the name, in order, ignoring case."""
+    words = query.split() if isinstance(query, str) else []
+    if not words or len(query) > 200:
+        raise BackendError("invalid", "Type part of a file name.")
+    pattern = ".*".join(re.escape(word) for word in words)
+    # A typed path ("Documents/notes") matches against the whole path; fd rejects "/" in name patterns.
+    scope = ["--full-path"] if "/" in query else []
+    # Plenty of candidates: fd returns them in arbitrary order and file_results ranks before trimming.
+    return ["fd", "--ignore-case", "--absolute-path", *scope, "--max-results", "2000", "--exclude", ".git", "--", pattern, str(home)]
+
+def file_results(output, query, home, limit=40):
+    """Rank fd output: exact and prefix name matches first, then shallower paths."""
+    term = " ".join(query.split()).lower().rstrip("/").rsplit("/", 1)[-1]
+    results = []
+    for line in output.decode(errors="replace").splitlines():
+        path = line.rstrip("/")
+        if not path:
+            continue
+        name = os.path.basename(path)
+        folder = os.path.dirname(path)
+        shown = "~" + folder[len(str(home)):] if folder == str(home) or folder.startswith(str(home) + "/") else folder
+        results.append({"path": path, "name": name, "folder": shown, "directory": line.endswith("/") or os.path.isdir(path),
+                        "rank": (name.lower() != term, not name.lower().startswith(term), path.count("/"), len(path))})
+    results.sort(key=lambda item: item["rank"])
+    return [{key: value for key, value in item.items() if key != "rank"} for item in results[:limit]]
+
+def accent_luminance(value):
+    if type(value) is not str or not re.fullmatch(r"#[0-9a-fA-F]{6}", value):
+        return None
+    channels = [int(value[index:index + 2], 16) / 255 for index in (1, 3, 5)]
+    linear = [channel / 12.92 if channel <= 0.04045 else ((channel + 0.055) / 1.055) ** 2.4 for channel in channels]
+    return sum(weight * channel for weight, channel in zip((0.2126, 0.7152, 0.0722), linear))
+
+# Room for album art sent inline as a data: URL (media.art caps the decoded image at 5 MB).
+REQUEST_LIMIT = 8 * 1024 * 1024
+# How long a read of the Security Mode may take before it is answered as unavailable.
+STATUS_DEADLINE = 12
+OVERVIEW_DEADLINE = 40
+
+async def read_request(reader, limit=REQUEST_LIMIT):
+    """The next request line, b"" at the end of input, or (None, id) for a line over the limit.
+
+    The oversized line is read to its end and dropped, so the next request starts cleanly; its id
+    (the shell writes it first) lets the caller answer that request instead of leaving it waiting."""
+    size, parts = 0, []
+    while True:
+        try:
+            chunk, end = await reader.readuntil(b"\n"), True
+        except asyncio.IncompleteReadError as error:
+            chunk, end = error.partial, True
+            if not chunk and not size:
+                return b""
+        except asyncio.LimitOverrunError as error:
+            chunk, end = await reader.read(max(1, error.consumed)), False
+        if size <= limit:
+            parts.append(chunk)
+        size += len(chunk)
+        if end:
+            if size <= limit + 1:
+                return b"".join(parts)
+            match = re.match(rb'\s*\{\s*"id"\s*:\s*(\d+)', parts[0][:100])
+            return None, int(match[1]) if match else None
+
+def emit(event, data):
+    print(json.dumps({"event": event, "data": data}, ensure_ascii=False), flush=True)
+
+def log_unexpected(error, context):
+    """A traceback on stderr, which the shell logs. D-Bus error text is left out: it can carry credentials."""
+    if getattr(error, "type", None):
+        detail = "".join(traceback.format_tb(error.__traceback__)) + f"{type(error).__name__}: {error.type}\n"
+    else:
+        detail = "".join(traceback.format_exception(error))
+    print(f"{context} failed:\n{detail}", end="", file=sys.stderr, flush=True)
+
+class BackendError(Exception):
+    def __init__(self, code, message, retryable=False, details=None):
+        self.code, self.message = code, message
+        self.retryable, self.details = retryable, details or {}
+        super().__init__(message)
+
+def atomic_json(path, value):
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd, name = tempfile.mkstemp(prefix=".nekrypta-", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w") as stream:
+            json.dump(value, stream, ensure_ascii=False)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(name, path)
+    finally:
+        if os.path.exists(name):
+            os.unlink(name)
+
+def is_time(value):
+    """A positive epoch time in milliseconds, as JavaScript's Date.now() gives it."""
+    return type(value) in (int, float) and math.isfinite(value) and 0 < value < 1e14
+
+def check_setting(key, value):
+    """Raises an "invalid" error for a value of an operational setting that the shell can't use."""
+    if key not in OPERATIONAL and key != "version":
+        raise BackendError("invalid", f"{key} is fixed in the personal configuration.")
+    if type(value) is not type(DEFAULTS[key]):
+        raise BackendError("invalid", f"Incorrect type for {key}.")
+    if key == "version" and value != 1:
+        raise BackendError("invalid", "Unsupported settings version.")
+    if key == "captureDelay" and value not in (0, 3, 5, 10):
+        raise BackendError("invalid", "Choose a supported capture delay.")
+    if key == "eqPreset" and value not in (*equalizer.PRESETS, "custom"):
+        raise BackendError("invalid", "Choose a supported equalizer preset.")
+    if key == "bluetoothAutoConnect" and (len(value) > 32 or not all(isinstance(a, str) and bluetooth_keep.ADDRESS.match(a) for a in value)
+                                          or len(set(value)) != len(value)):
+        raise BackendError("invalid", "Choose Bluetooth devices by their address.")
+    if key == "searchEngine" and value not in SEARCH_ENGINES:
+        raise BackendError("invalid", "Choose a supported search engine.")
+    if key == "recordAudio" and value not in RECORD_AUDIO:
+        raise BackendError("invalid", "Choose system audio, the microphone or no audio.")
+    if key == "focusMinutes" and value not in (25, 50, 90):
+        raise BackendError("invalid", "Choose a supported focus length.")
+    # "recorded": where the part of a session already handled ends, for a session resumed with Undo.
+    if key == "focusSession" and value and not (set(value) in ({"started", "ends"}, {"started", "ends", "recorded"})
+                                                and all(is_time(value[k]) for k in value) and value["started"] < value["ends"]
+                                                and value["started"] <= value.get("recorded", value["started"]) <= value["ends"]):
+        raise BackendError("invalid", "Incorrect focus session.")
+    if key == "timers" and (len(value) > 10 or not all(isinstance(t, dict) and set(t) == {"label", "ends", "seconds"}
+                                                         and isinstance(t["label"], str) and len(t["label"]) <= 60
+                                                         and is_time(t["ends"]) and type(t["seconds"]) is int and 0 < t["seconds"] <= 86400
+                                                         for t in value)):
+        raise BackendError("invalid", "Incorrect timers.")
+    if key == "visualizer" and type(value) is not bool:
+        raise BackendError("invalid", f"Incorrect type for {key}.")
+    try:
+        if key == "eqBands":
+            equalizer.validate(value)
+    except ValueError as error:
+        raise BackendError("invalid", str(error)) from None
+
+def settings():
+    """The fixed personal configuration over the operational state saved in state.json."""
+    try:
+        value = json.loads(CONFIG.read_text())
+        if not isinstance(value, dict) or value.get("version", 1) != 1:
+            raise ValueError("Unsupported state schema")
+    except FileNotFoundError:
+        return dict(DEFAULTS)
+    except (ValueError, OSError):
+        return {**DEFAULTS, "diagnostic": "State could not be loaded; defaults are active."}
+    # A hand-edited value, or one a newer version wrote, costs only that entry.
+    rejected = []
+    for key in [key for key in value if key != "version"]:
+        try:
+            check_setting(key, value[key])
+        except (BackendError, KeyError):
+            rejected.append(key)
+            del value[key]
+    if rejected:
+        return {**DEFAULTS, **value, **personal.FIXED, "diagnostic": "Some saved state could not be loaded and uses defaults: " + ", ".join(rejected) + "."}
+    return {**DEFAULTS, **value, **personal.FIXED}
+
+def save_settings(changes):
+    """Saves the operational keys of `changes` after validating them; returns every setting. Fixed keys are ignored."""
+    current = settings()
+    unreadable = current.pop("diagnostic", None) is not None
+    changes = {key: value for key, value in changes.items() if key in OPERATIONAL}
+    for key, value in changes.items():
+        check_setting(key, value)
+    if CONFIG.exists() and unreadable:
+        # Keep the unreadable file instead of replacing it.
+        shutil.copy2(CONFIG, CONFIG.with_suffix(".invalid.json"))
+    current.update(changes)
+    atomic_json(CONFIG, changed_only(current))
+    return current
+
+def record_audio(value):
+    """The audio choice of a recording request; shells before recordAudio sent a system-audio flag."""
+    if type(value) is bool:
+        value = "system" if value else "none"
+    if not isinstance(value, str) or value not in RECORD_AUDIO:
+        raise BackendError("invalid", "Choose system audio, the microphone or no audio.")
+    return value
+
+def number(params, key, default):
+    """A finite number from request params, or an "invalid" error naming the field."""
+    try:
+        value = float(params.get(key, default))
+    except (TypeError, ValueError):
+        value = math.nan
+    if not math.isfinite(value):
+        raise BackendError("invalid", f"{key} must be a number.")
+    return value
+
+def modified(path):
+    try:
+        return path.stat().st_mtime
+    except OSError:  # removed by another request meanwhile
+        return 0
+
+def changed_only(values):
+    """The operational state that differs from its initial value."""
+    return {"version": 1, **{key: value for key, value in values.items() if key in OPERATIONAL and value != DEFAULTS.get(key)}}
+
+def telemetry_projection(sample):
+    """The compact contract for the bar, projected from the shared system sampler result."""
+    sample = sample if isinstance(sample, dict) else {}
+    cpu = sample.get("cpu") if isinstance(sample.get("cpu"), dict) else {}
+    memory = sample.get("memory") if isinstance(sample.get("memory"), dict) else {}
+    recorded = sample.get("recorded") if isinstance(sample.get("recorded"), dict) else {}
+    cpu_percent = cpu.get("usage")
+    cpu_available = bool(cpu.get("available")) and isinstance(cpu_percent, (int, float)) \
+        and recorded.get("cpu") is not None and math.isfinite(float(cpu_percent))
+    total = memory.get("total")
+    used = memory.get("used")
+    memory_available = bool(memory.get("available")) and isinstance(total, (int, float)) \
+        and isinstance(used, (int, float)) and total > 0 and used >= 0
+    return {
+        "cpu": {"state": "disponivel" if cpu_available else "indisponivel",
+                "percent": round(max(0.0, min(100.0, float(cpu_percent))), 1) if cpu_available else None},
+        "memory": {"state": "disponivel" if memory_available else "indisponivel",
+                   "percent": round(100.0 * used / total, 1) if memory_available else None,
+                   "usedGiB": round(used / 1073741824, 2) if memory_available else None,
+                   "totalGiB": round(total / 1073741824, 2) if memory_available else None},
+    }
+
+def display_number(value):
+    """How a result is shown and copied: exact integers, floats to 12 significant digits (0.1 + 0.2 is 0.3)."""
+    if isinstance(value, int):
+        return str(value)
+    if value == int(value) and abs(value) < 1e15:
+        return str(int(value))
+    text = f"{value:.12g}"
+    return text.replace("e+", "e")
+
+def calculate(expression):
+    if not isinstance(expression, str) or len(expression) > 256:
+        raise BackendError("invalid", "Enter an expression of at most 256 characters.")
+    ops = {ast.Add: operator.add, ast.Sub: operator.sub, ast.Mult: operator.mul,
+           ast.Div: operator.truediv, ast.FloorDiv: operator.floordiv, ast.Mod: operator.mod,
+           ast.Pow: operator.pow}
+    def visit(node, depth=0):
+        if depth > 24:
+            raise ValueError()
+        if isinstance(node, ast.Constant) and type(node.value) in (int, float):
+            value = node.value
+        elif isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
+            value = visit(node.operand, depth + 1) * (-1 if isinstance(node.op, ast.USub) else 1)
+        elif isinstance(node, ast.BinOp) and type(node.op) in ops:
+            # The left side of a chain ("1+1+1…") stays at this depth: the chain is long, not nested.
+            left, right = visit(node.left, depth), visit(node.right, depth + 1)
+            if isinstance(node.op, ast.Pow) and (abs(right) > 100 or abs(left) > 1e12):
+                raise ValueError()
+            value = ops[type(node.op)](left, right)
+        else:
+            raise ValueError()
+        if type(value) not in (int, float) or not math.isfinite(value) or abs(value) > 1e100:
+            raise ValueError()
+        return value
+    try:
+        value = visit(ast.parse(expression, mode="eval").body)
+        return {"value": value, "text": display_number(value)}
+    except (ValueError, SyntaxError, ZeroDivisionError, OverflowError, TypeError):
+        raise BackendError("invalid", "Use finite arithmetic with +, -, *, /, //, %, ** and parentheses.") from None
+
+async def run(*args, data=None, timeout=15, cancel_ok=False):
+    if not shutil.which(args[0]):
+        raise BackendError("unavailable", f"Install {args[0]} to use this feature.")
+    # wl-copy forks a child that serves the clipboard; if it inherits our pipes, communicate() never sees EOF.
+    detached = args[0] == "wl-copy"
+    process = await asyncio.create_subprocess_exec(*args, stdin=asyncio.subprocess.PIPE if data is not None else asyncio.subprocess.DEVNULL,
+                                                   stdout=asyncio.subprocess.DEVNULL if detached else asyncio.subprocess.PIPE,
+                                                   stderr=asyncio.subprocess.DEVNULL)
+    try:
+        out, _ = await asyncio.wait_for(process.communicate(data), timeout)
+    except (asyncio.TimeoutError, asyncio.CancelledError) as error:
+        try:
+            process.kill()
+        except ProcessLookupError:
+            pass
+        # Bounded: a leftover grandchild holding a pipe must not keep the caller (and its locks) stuck.
+        try:
+            await asyncio.wait_for(process.wait(), 2)
+        except asyncio.TimeoutError:
+            pass
+        if isinstance(error, asyncio.CancelledError):
+            raise
+        raise BackendError("timeout", f"{args[0]} did not finish in time.") from None
+    if process.returncode:
+        raise BackendError("cancelled" if cancel_ok else "failed", "Action cancelled." if cancel_ok else f"{args[0]} failed (exit {process.returncode}).")
+    return out
+
+
+BINARY_ENTRY = re.compile(r"^\[\[ binary data (?P<size>[\d.]+ \w+) (?P<kind>\w+)(?: (?P<width>\d+)x(?P<height>\d+))? \]\]$")
+
+
+def clipboard_label(text):
+    """Readable label for cliphist's binary summaries, e.g. "Image · PNG · 1920×1080 · 1.2 MiB"."""
+    match = BINARY_ENTRY.match(text.strip()) if "[[" in text[:4] else None
+    if not match:
+        return ""
+    kind = match["kind"].lower()
+    image = kind in ("png", "jpeg", "jpg", "gif", "webp", "bmp", "svg", "tiff", "avif")
+    parts = ["Image" if image else "Data", match["kind"].upper()]
+    if match["width"]:
+        parts.append(match["width"] + "×" + match["height"])
+    parts.append(match["size"])
+    return " · ".join(parts)
+
+
+# Six or eight digits only: "#123" and "#bad" are far more often issue numbers and hashtags.
+HEX_COLOR = re.compile(r"#([0-9a-f]{6}|[0-9a-f]{8})", re.IGNORECASE)
+RGB_COLOR = re.compile(r"rgba?\(\s*(\d{1,3})\s*,\s*(\d{1,3})\s*,\s*(\d{1,3})\s*(?:,\s*\d*\.?\d+%?\s*)?\)", re.IGNORECASE)
+
+
+def clipboard_color(text):
+    """"#rrggbb" for a copied hex or rgb() color, else "". Alpha is dropped: QML reads #aarrggbb."""
+    if match := HEX_COLOR.fullmatch(text):
+        return "#" + match[1][:6].lower()
+    if (match := RGB_COLOR.fullmatch(text)) and all(int(channel) <= 255 for channel in match.groups()):
+        return "#" + ''.join(f"{int(channel):02x}" for channel in match.groups())
+    return ""
+
+
+LINK = re.compile(r"https?://\S+", re.IGNORECASE)
+
+
+def clipboard_link(text):
+    if not LINK.fullmatch(text):
+        return False
+    try:
+        return bool(urlsplit(text).hostname)
+    except ValueError:
+        return False
+
+
+def clipboard_path(text):
+    """The existing local file or folder a copied path or file:// URL names, else None."""
+    if "\n" in text:
+        return None
+    if text.startswith("file://"):
+        try:
+            parts = urlsplit(text)
+        except ValueError:
+            return None
+        if parts.netloc not in ("", "localhost"):
+            return None
+        text = unquote(parts.path)
+    elif not text.startswith(("/", "~/")):
+        return None
+    try:
+        path = Path(text).expanduser()
+        return path if path.is_absolute() and path.exists() else None
+    except (OSError, ValueError, RuntimeError):
+        return None
+
+
+def clipboard_kind(text):
+    """A color or link in a cliphist preview line, which ends in "…" when cut. Most lines are neither,
+    so the first character settles them before any pattern runs. Paths need the disk: see path_kinds."""
+    first = text[:1]
+    if first in ("#", "r", "R") and (color := clipboard_color(text)):
+        return {"kind": "color", "color": color}
+    if first in ("h", "H") and clipboard_link(text.removesuffix("…")):
+        return {"kind": "link"}
+    return {}
+
+
+def path_kinds(texts):
+    """{"kind": "path", "folder": bool} for each text naming an existing file or folder, else None."""
+    paths = [clipboard_path(text) for text in texts]
+    return [{"kind": "path", "folder": path.is_dir()} if path else None for path in paths]
+
+
+def clipboard_target(text):
+    """What Open does with a full clipboard entry: a link opens; a file is only shown in its folder,
+    since anything can put a path on the clipboard and opening it could run it."""
+    if clipboard_link(text):
+        return {"url": text}
+    if path := clipboard_path(text):
+        return {"path": str(path if path.is_dir() else path.parent)}
+    return None
+
+
+PROPERTIES = "org.freedesktop.DBus.Properties"
+SERVICE_MISSING = ("org.freedesktop.DBus.Error.ServiceUnknown", "org.freedesktop.DBus.Error.NameHasNoOwner")
+FLATPAK_SCOPE = re.compile(r"app-flatpak-([A-Za-z0-9_.-]+?)-\d+\.scope")
+
+class TimedInterface:
+    """A dbus-next proxy interface whose method calls give up after `timeout` seconds."""
+    def __init__(self, proxy, timeout):
+        self._proxy, self._timeout = proxy, timeout
+
+    def __getattr__(self, attribute):
+        value = getattr(self._proxy, attribute)
+        if not attribute.startswith("call_"):
+            return value
+        async def call(*args, **options):
+            try:
+                return await asyncio.wait_for(value(*args, **options), self._timeout)
+            except asyncio.TimeoutError:
+                raise BackendError("timeout", "A system service did not answer in time.") from None
+        return call
+
+def key_management(rsn_flags):
+    """NetworkManager key-mgmt for a new password network: sae when the access point offers only WPA3
+    (SAE without PSK); WPA2/WPA3 transition networks keep wpa-psk."""
+    return "sae" if rsn_flags & 0x400 and not rsn_flags & 0x100 else "wpa-psk"
+
+
+NM_CONNECTIVITY = {0: "unknown", 1: "none", 2: "portal", 3: "limited", 4: "full"}
+SSID_MAX = 255
+
+
+def wifi_state(device_state, powered=True, connectivity="unknown", device_type="wifi"):
+    """Map NetworkManager's numeric state to the stable Portuguese wifi contract."""
+    if device_type == "cabo" and device_state == 100:
+        return "cabo"
+    if not powered:
+        return "wifi_desativado"
+    if device_state in (40, 50, 60, 70, 80, 90):
+        return "conectando"
+    if device_state == 100:
+        return "conectado" if connectivity in ("full", "unknown") else "sem_internet"
+    if device_state in (20, 30, 110, 120):
+        return "desconectado"
+    return "procurando"
+
+
+def mask_local_ip(value):
+    """Keep the network contract useful without exposing the host's full address."""
+    value = str(value).split("/", 1)[0]
+    if re.fullmatch(r"\d{1,3}(?:\.\d{1,3}){3}", value):
+        return ".".join(value.split(".")[:2] + ["x", "x"])
+    if ":" in value:
+        return ":".join(value.split(":")[:2] + ["x"])
+    return None
+
+
+def wifi_connect_args(ssid, known):
+    """Build the only two allowed NetworkManager connect vectors."""
+    if not isinstance(ssid, str) or not ssid or len(ssid) >  SSID_MAX or any(char in ssid for char in "\x00\r\n"):
+        raise BackendError("invalid", "Escolha uma rede Wi-Fi válida.")
+    return (("nmcli", "connection", "up", "id", ssid) if known
+            else ("nmcli", "device", "wifi", "connect", ssid))
+
+
+def parse_nmcli_device_show(text):
+    values = {}
+    for line in str(text).splitlines():
+        key, separator, value = line.partition(":")
+        if separator:
+            values[key.strip()] = value.strip()
+    return values
+
+
+def parse_nmcli_devices(text):
+    sections, current = [], {}
+    for line in str(text).splitlines():
+        key, separator, value = line.partition(":")
+        if not separator:
+            continue
+        key, value = key.strip(), value.strip()
+        if key == "GENERAL.DEVICE" and current:
+            sections.append(current)
+            current = {}
+        current[key] = value
+    if current:
+        sections.append(current)
+    return sections
+
+
+def parse_nmcli_wifi(text, known=()):
+    networks = []
+    known = set(known)
+    for line in str(text).splitlines():
+        fields = line.split(":", 4)
+        if len(fields) < 5:
+            continue
+        in_use, ssid, security, signal, device = fields
+        if not ssid:
+            continue
+        protected = security not in ("", "--")
+        networks.append({"path": device, "name": ssid, "ssid": ssid,
+                         "type": "secured" if protected else "open",
+                         "security": "protegida" if protected else "aberta",
+                         "connected": in_use == "*", "connecting": False,
+                         "saved": ssid in known, "known": ssid in known,
+                         "signal": int(signal) if signal.isdigit() else 0})
+    return networks
+
+async def tray_owner(call, item_id, title=""):
+    """The pid of the process that owns a tray item, found through the StatusNotifierWatcher.
+
+    `call(destination, path, interface, member, signature, body)` returns the reply body."""
+    (registered,) = await call("org.kde.StatusNotifierWatcher", "/StatusNotifierWatcher", PROPERTIES, "Get", "ss",
+                               ["org.kde.StatusNotifierWatcher", "RegisteredStatusNotifierItems"])
+    matches = []
+    for entry in registered.value:
+        # "service/object/path", or just the service with the default path.
+        service, _, path = entry.partition("/")
+        path = "/" + path if path else "/StatusNotifierItem"
+        try:
+            (value,) = await call(service, path, PROPERTIES, "Get", "ss", ["org.kde.StatusNotifierItem", "Id"])
+            if value.value != item_id:
+                continue
+            if title:
+                (value,) = await call(service, path, PROPERTIES, "Get", "ss", ["org.kde.StatusNotifierItem", "Title"])
+            matches.append((service, value.value == title))
+        except BackendError:
+            continue  # an item that went away or doesn't answer
+    if not matches:
+        raise BackendError("unavailable", "This app can't be closed from here.")
+    # Two items can share an id (two windows of one app); the title tells them apart.
+    service = next((service for service, same in matches if same), matches[0][0])
+    (pid,) = await call("org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus",
+                        "GetConnectionUnixProcessID", "s", [service])
+    return pid
+
+async def quit_process(pid, proc=Path("/proc"), kill=os.kill, command=None, protected=()):
+    """Ask a tray app to exit: SIGTERM, or `flatpak kill` for a Flatpak (its D-Bus peer is a proxy)."""
+    if not isinstance(pid, int) or pid <= 1 or pid in (os.getpid(), os.getppid(), *protected):
+        raise BackendError("unavailable", "This app can't be closed from here.")
+    try:
+        if (proc / str(pid)).stat().st_uid != os.getuid():
+            raise BackendError("unavailable", "This app belongs to another user.")
+        cgroup = (proc / str(pid) / "cgroup").read_text()
+    except OSError:
+        raise BackendError("unavailable", "The app has already exited.") from None
+    flatpak = FLATPAK_SCOPE.search(cgroup)
+    if flatpak:
+        await (command or run)("flatpak", "kill", flatpak[1], timeout=5)
+        return {"quit": flatpak[1]}
+    try:
+        kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        raise BackendError("unavailable", "The app has already exited.") from None
+    return {"quit": pid}
+
+class Backend:
+    def __init__(self):
+        # Keeps the previous counters for the system monitor's rates.
+        self.sysmon = sysmon.Sampler(run=run)
+        self.session_locked = False
+        self.session_sleeping = False
+        self.lid_fd = None
+        self.lid_lock = asyncio.Lock()
+        self.bus = None
+        self.session_bus = None
+        self.bus_lock = asyncio.Lock()
+        self.wifi_lock = asyncio.Lock()
+        self.vpn_lock = asyncio.Lock()
+        self.wallpaper_lock = asyncio.Lock()
+        self.daemon_lock = asyncio.Lock()
+        self.wallhaven_lock = asyncio.Lock()
+        self.capture_lock = asyncio.Lock()
+        self.pairing_reply = None
+        self.pairing_lock = asyncio.Lock()
+        self.equalizer = equalizer.Equalizer(RUNTIME)
+        self.eq_lock = asyncio.Lock()
+        self.eq_requests = 0
+        self.weather_lock = asyncio.Lock()
+        self.mullvad = mullvad.Mullvad(event_sink=lambda event, data: emit(event, data),
+                                       snapshot_path=STATE / "security-session.json")
+        self.security = security.SecurityCenter(self.mullvad, exposure, event_sink=lambda event, data: emit(event, data),
+                                                tailscale_policy=personal.SECURITY["allowTailscaleMinecraft"],
+                                                tailscale_peer=personal.SECURITY.get("minecraftPeer") or None)
+        self.visualizer = visualizer.Visualizer(event_sink=lambda event, data: emit(event, data))
+        self.lock_hint_lock = asyncio.Lock()
+        # Clipboard entries deleted, and wipes so far: a preview still being decoded for one must not be saved after.
+        self.clipboard_deleted = set()
+        self.clipboard_wipes = 0
+        # Closes links left open after a device switched off and runs auto-connect; set up by watch_bluetooth.
+        self.bluetooth = None
+
+    async def close(self):
+        await self.security.close()
+        await self.visualizer.close()
+
+    async def interface(self, name, path, interface, timeout=25):
+        """A system bus interface whose method calls time out after `timeout` seconds (None: never)."""
+        try:
+            from dbus_next.aio import MessageBus
+            from dbus_next import BusType
+        except ImportError:
+            raise BackendError("unavailable", "Install python-dbus-next to enable system controls.") from None
+        async with self.bus_lock:
+            if self.bus is None or not self.bus.connected:
+                self.bus = await MessageBus(bus_type=BusType.SYSTEM, negotiate_unix_fd=True).connect()
+        intro = await self.bus.introspect(name, path)
+        proxy = self.bus.get_proxy_object(name, path, intro).get_interface(interface)
+        return proxy if timeout is None else TimedInterface(proxy, timeout)
+
+    async def session_call(self, destination, path, interface, member, signature="", body=()):
+        """One call on the session bus, without introspection; returns the reply body."""
+        try:
+            from dbus_next.aio import MessageBus
+            from dbus_next import BusType, Message, MessageType
+        except ImportError:
+            raise BackendError("unavailable", "Install python-dbus-next to enable system controls.") from None
+        async with self.bus_lock:
+            if self.session_bus is None or not self.session_bus.connected:
+                self.session_bus = await MessageBus(bus_type=BusType.SESSION).connect()
+        message = Message(destination=destination, path=path, interface=interface, member=member,
+                          signature=signature, body=list(body))
+        try:
+            reply = await asyncio.wait_for(self.session_bus.call(message), 3)
+        except asyncio.TimeoutError:
+            raise BackendError("unavailable", "The app did not answer.") from None
+        if reply.message_type == MessageType.ERROR:
+            raise BackendError("unavailable", (reply.body or [reply.error_name])[0])
+        return reply.body
+
+    async def wallpaper_daemon(self):
+        """hyprpaper, awww or swww, started if none runs yet; an "unavailable" error otherwise."""
+        async with self.daemon_lock:
+            daemon = await wallpaper.ensure()
+        if daemon in (None, "foreign"):
+            raise wallpaper.unavailable(daemon, BackendError)
+        return daemon
+
+    async def active_wallpapers(self):
+        """Monitor name -> image the running daemon shows. Never starts a daemon; only apply and restore do."""
+        daemon = wallpaper.current()
+        if daemon == "foreign" or (daemon is None and not wallpaper.installed()):
+            raise wallpaper.unavailable(daemon, BackendError)
+        return await wallpaper.active(run, daemon) if daemon else {}
+
+    async def apply_equalizer(self, enabled, bands):
+        """Makes the filter match: off, or running with `bands` (validated). Call with eq_lock held."""
+        # Past validation, any ValueError is PipeWire's (unreadable pw-dump output), not the bands.
+        try:
+            if not enabled:
+                await asyncio.to_thread(self.equalizer.stop)
+            elif not self.equalizer.running:
+                await self.equalizer.start(run, bands)
+            elif bands != self.equalizer.bands:
+                await self.equalizer.update(run, bands)
+        except RuntimeError as error:
+            raise BackendError("failed", str(error)) from None
+        except ValueError:
+            raise BackendError("failed", "PipeWire gave an unreadable answer; try again.") from None
+
+    async def resume_equalizer(self, delays):
+        """Starts the filter the settings ask for, trying again after each delay (PipeWire may still be
+        starting). Leaves it to the shell once it sends eq.apply; False if every attempt failed."""
+        requests = self.eq_requests
+        for delay in delays:
+            await asyncio.sleep(delay)
+            saved = settings()
+            async with self.eq_lock:
+                if self.eq_requests != requests or not saved["eqEnabled"] or self.equalizer.running:
+                    return True
+                try:
+                    await self.equalizer.start(run, equalizer.validate(saved["eqBands"]))
+                    return True
+                except (RuntimeError, ValueError, BackendError) as error:
+                    print("Equalizer:", getattr(error, "message", error), file=sys.stderr, flush=True)
+        return False
+
+    async def check_equalizer(self, delays=(1, 2, 4, 8, 16)):
+        """Brings back a filter that exited on its own (PipeWire restarted, the filter crashed); reports
+        an "eq" event with the equalizer status when it can't."""
+        async with self.eq_lock:
+            if self.equalizer.process is None or self.equalizer.running:
+                return
+            await asyncio.to_thread(self.equalizer.stop)
+        print("Equalizer: the filter exited; restarting it.", file=sys.stderr, flush=True)
+        if not await self.resume_equalizer(delays):
+            emit("eq", self.equalizer.status())
+
+    COMMANDS = ["hyprctl", "cliphist", "wl-copy", "wl-paste", "grim", "slurp", "hyprpicker", "wf-recorder", "brightnessctl",
+                "hyprlock", "hypridle", "fd", "cava", "hyprpaper", "awww", "swww"]
+
+    async def capabilities(self):
+        """What this machine offers, so the shell can hide controls instead of failing on click."""
+        try:
+            monitors = json.loads(await run("hyprctl", "monitors", "-j"))
+            builtin_panel = any(BUILTIN_PANEL.fullmatch(str(m.get("name", ""))) for m in monitors)
+        except (BackendError, ValueError, TypeError):
+            builtin_panel = None
+        return {"commands": {x: bool(shutil.which(x)) for x in self.COMMANDS},
+                "dbus": importlib.util.find_spec("dbus_next") is not None,
+                "lid": any(Path("/proc/acpi/button/lid").glob("*")),
+                "builtinPanel": builtin_panel, "version": 1}
+
+    async def security_status(self):
+        """The mode's own state, always answered: a daemon that does not reply in time reads as "indisponivel"
+        with the reason, never as an endless wait or an empty state."""
+        if self.mullvad.lock.locked() and not self.mullvad._recovery_pending:
+            # An activation, a restore or the watcher holds the CLI: the mode is answered from memory, not queued
+            # behind a connection that can take most of a minute.
+            return {"state": self.mullvad._state, "stale": False, "inProgress": True, "checkedAt": time.time()}
+        try:
+            result = await asyncio.wait_for(self.mullvad.status(), STATUS_DEADLINE)
+        except asyncio.TimeoutError:
+            return {"state": "indisponivel", "stale": True, "reason": "timeout",
+                    "message": "A Mullvad não respondeu no prazo.", "checkedAt": time.time()}
+        except mullvad.MullvadError as error:
+            return {"state": "indisponivel", "stale": True, "reason": error.code, "message": error.message,
+                    "checkedAt": time.time()}
+        result["checkedAt"] = time.time()
+        result["stale"] = False
+        return result
+
+    async def session_path(self):
+        """The logind object path of the shell's session: $XDG_SESSION_ID, else the session this process
+        runs in, else (started from a systemd user unit, outside any session) this user's first seat session."""
+        manager = await self.interface("org.freedesktop.login1", "/org/freedesktop/login1", "org.freedesktop.login1.Manager")
+        for lookup, argument in ((manager.call_get_session, os.environ.get("XDG_SESSION_ID")),
+                                 (manager.call_get_session_by_pid, os.getpid())):
+            if argument:
+                try:
+                    return await lookup(argument)
+                except Exception:
+                    pass  # a stale session id, or a process outside any session
+        sessions = await manager.call_list_sessions()
+        path = next((s[4] for s in sessions if s[1] == os.getuid() and s[3]), None)
+        if not path:
+            raise BackendError("unavailable", "No logind session was found.")
+        return path
+
+    async def bluetooth_call(self, path, member, timeout=25):
+        """Device1.Connect or Disconnect on one device, without introspecting it."""
+        from dbus_next import Message, MessageType
+        await self.interface("org.bluez", "/", "org.freedesktop.DBus.ObjectManager")  # connects the bus, checks BlueZ is there
+        reply = await asyncio.wait_for(self.bus.call(Message(destination="org.bluez", path=path, interface="org.bluez.Device1", member=member)), timeout)
+        if reply.message_type == MessageType.ERROR:
+            if reply.error_name in ("org.bluez.Error.AlreadyConnected", "org.bluez.Error.NotConnected"):
+                return  # it got there by itself
+            if reply.error_name in SERVICE_MISSING or reply.error_name == "org.freedesktop.DBus.Error.UnknownObject":
+                raise BackendError("unavailable", "That device is no longer available.")
+            raise BackendError("failed", reply.error_name)
+
+    async def watch_bluetooth(self):
+        """Follows BlueZ's objects and properties for bluetooth_keep, from login until the helper stops."""
+        from dbus_next import Message, MessageType
+        manager = await self.interface("org.bluez", "/", "org.freedesktop.DBus.ObjectManager")
+        if self.bluetooth is None:
+            self.bluetooth = bluetooth_keep.Keeper(lambda path: self.bluetooth_call(path, "Connect"),
+                                                   lambda path: self.bluetooth_call(path, "Disconnect"),
+                                                   lambda: settings()["bluetoothAutoConnect"])
+        keeper = self.bluetooth
+        keeper.load(await manager.call_get_managed_objects())
+        for rule in ("type='signal',sender='org.bluez',interface='org.freedesktop.DBus.ObjectManager'",
+                     "type='signal',sender='org.bluez',interface='org.freedesktop.DBus.Properties',member='PropertiesChanged'",
+                     "type='signal',sender='org.freedesktop.DBus',member='NameOwnerChanged',arg0='org.bluez'"):
+            await self.bus.call(Message(destination="org.freedesktop.DBus", path="/org/freedesktop/DBus", interface="org.freedesktop.DBus",
+                                        member="AddMatch", signature="s", body=[rule]))
+
+        async def reload():
+            # bluetoothd restarted: its objects are new.
+            try:
+                keeper.load(await (await self.interface("org.bluez", "/", "org.freedesktop.DBus.ObjectManager")).call_get_managed_objects())
+                keeper.trigger("Bluetooth service started", fresh=True)
+            except Exception as error:
+                log_unexpected(error, "Bluetooth watch")
+
+        def on_message(message):
+            if message.message_type != MessageType.SIGNAL:
+                return
+            try:
+                if message.member == "NameOwnerChanged" and message.body[0] == "org.bluez" and message.body[2]:
+                    asyncio.ensure_future(reload())
+                elif not (message.path or "").startswith("/org/bluez") and message.path != "/":
+                    return
+                elif message.member == "InterfacesAdded":
+                    keeper.added(message.body[0], message.body[1])
+                elif message.member == "InterfacesRemoved":
+                    keeper.removed(message.body[0], message.body[1])
+                elif message.member == "PropertiesChanged" and message.interface == "org.freedesktop.DBus.Properties":
+                    keeper.changed(message.path, message.body[0], message.body[1])
+            except Exception as error:
+                log_unexpected(error, "Bluetooth watch")
+        self.bus.add_message_handler(on_message)
+        keeper.trigger("login", fresh=True)
+
+    async def objects(self, name):
+        manager = await self.interface(name, "/", "org.freedesktop.DBus.ObjectManager")
+        return await manager.call_get_managed_objects()
+
+    async def vpn(self, action, p):
+        """NetworkManager's VPN and WireGuard profiles. Secrets (passwords, one-time codes) are asked for by
+        NetworkManager's own secret agent, as they would be from any other client."""
+        name = "org.freedesktop.NetworkManager"
+        from dbus_next import Variant  # importable once interface() has found dbus-next
+        manager = await self.interface(name, "/org/freedesktop/NetworkManager", name)
+        manager_props = await self.interface(name, "/org/freedesktop/NetworkManager", "org.freedesktop.DBus.Properties")
+        settings = await self.interface(name, "/org/freedesktop/NetworkManager/Settings", name + ".Settings")
+        profiles = {}
+        for path in await settings.call_list_connections():
+            connection = await self.interface(name, path, name + ".Settings.Connection")
+            try:
+                config = await connection.call_get_settings()
+            except Exception:
+                continue  # A system profile may be private to another user.
+            section = config.get("connection", {})
+            kind = section.get("type", Variant("s", "")).value
+            if kind not in ("vpn", "wireguard"):
+                continue
+            # "org.freedesktop.NetworkManager.openvpn" → "OpenVPN"-ish short names for the subtitle.
+            service = config.get("vpn", {}).get("service-type", Variant("s", "")).value if kind == "vpn" else "wireguard"
+            profiles[path] = {"path": path, "name": section.get("id", Variant("s", "VPN")).value,
+                              "kind": service.rsplit(".", 1)[-1] or kind, "state": "off", "active": ""}
+        for active in (await manager_props.call_get(name, "ActiveConnections")).value:
+            props = await self.interface(name, active, "org.freedesktop.DBus.Properties")
+            try:
+                connection = (await props.call_get(name + ".Connection.Active", "Connection")).value
+                state = (await props.call_get(name + ".Connection.Active", "State")).value
+            except Exception:
+                continue  # it went away while being read
+            if connection in profiles:
+                profiles[connection].update(active=active, state={1: "connecting", 2: "on", 3: "disconnecting"}.get(state, "off"))
+        if action == "list":
+            return {"connections": [{key: value for key, value in profile.items() if key != "active"}
+                                    for profile in sorted(profiles.values(), key=lambda profile: profile["name"].lower())]}
+        profile = profiles.get(p.get("path"))
+        if profile is None:
+            raise BackendError("invalid", "Choose a VPN connection.")
+        if action == "disconnect":
+            if profile["active"]:
+                await manager.call_deactivate_connection(profile["active"])
+            return {"done": True}
+        if action != "connect":
+            raise BackendError("invalid", "Unknown VPN operation.")
+        if profile["state"] == "on":
+            return {"done": True}
+        active_path = profile["active"] or await manager.call_activate_connection(profile["path"], "/", "/")
+        active_props = await self.interface(name, active_path, "org.freedesktop.DBus.Properties")
+        # Long enough to type a password or a one-time code into NetworkManager's prompt.
+        for _ in range(180):
+            try:
+                state = (await active_props.call_get(name + ".Connection.Active", "State")).value
+            except Exception:
+                state = 4  # the active connection object is gone: it failed
+            if state == 2:
+                return {"done": True}
+            if state == 4:
+                raise BackendError("failed", f"Could not connect to {profile['name']}. A VPN that needs a password also needs a "
+                                             "NetworkManager secret agent, such as nm-applet.")
+            await asyncio.sleep(0.5)
+        raise BackendError("timeout", f"Connecting to {profile['name']} timed out.")
+
+    async def wifi_nmcli(self, action, p):
+        """NetworkManager fallback for hosts without python-dbus-next."""
+        if action == "power":
+            powered = bool(p.get("powered", True))
+            await run("nmcli", "radio", "wifi", "on" if powered else "off", timeout=10)
+            return {"done": True, "powered": powered,
+                    "state": "procurando" if powered else "wifi_desativado"}
+        if action == "scan":
+            await run("nmcli", "device", "wifi", "rescan", timeout=15)
+            return {"accepted": True, "state": "procurando"}
+        try:
+            device_text = await run("nmcli", "-t", "-f", "GENERAL.DEVICE,GENERAL.TYPE,GENERAL.STATE,GENERAL.CONNECTION,IP4.ADDRESS", "device", "show", timeout=5)
+            devices = parse_nmcli_devices(device_text.decode(errors="replace") if isinstance(device_text, bytes) else device_text)
+            device = next((item for item in devices if item.get("GENERAL.TYPE") == "wifi"),
+                          next((item for item in devices if item.get("GENERAL.TYPE") == "ethernet"), {}))
+            wifi_enabled = (await run("nmcli", "-t", "radio", "wifi", timeout=5)).decode(errors="replace").strip().lower() == "enabled"
+            connectivity = (await run("nmcli", "-t", "-f", "CONNECTIVITY", "general", timeout=5)).decode(errors="replace").strip().lower()
+            known_text = await run("nmcli", "-t", "-f", "NAME,TYPE", "connection", "show", timeout=5)
+            known = [line.split(":", 1)[0] for line in (known_text.decode(errors="replace") if isinstance(known_text, bytes) else str(known_text)).splitlines()
+                     if line.endswith(":802-11-wireless")]
+            wifi_text = await run("nmcli", "-t", "-f", "IN-USE,SSID,SECURITY,SIGNAL,DEVICE", "device", "wifi", "list", "--rescan", "no", timeout=10)
+            networks = parse_nmcli_wifi(wifi_text.decode(errors="replace") if isinstance(wifi_text, bytes) else wifi_text, known)
+        except BackendError:
+            raise
+        device_type = device.get("GENERAL.TYPE", "")
+        state_text = device.get("GENERAL.STATE", "")
+        state_number = int(state_text.split()[0]) if state_text[:1].isdigit() else 0
+        if device_type == "ethernet" and state_number == 100:
+            return {"available": True, "type": "cabo", "state": "cabo", "connectivity": connectivity,
+                    "powered": True, "ssid": None, "signal": None, "ip": None, "networks": []}
+        current = next((item for item in networks if item["connected"]), None)
+        if action == "list":
+            return {"available": True, "type": "wifi" if device_type == "wifi" else "nenhum",
+                    "state": wifi_state(state_number, wifi_enabled, connectivity),
+                    "connectivity": connectivity, "powered": wifi_enabled,
+                    "ssid": current["ssid"] if current else None,
+                    "signal": current["signal"] if current else None,
+                    "ip": mask_local_ip(device.get("IP4.ADDRESS[1]")), "networks": networks}
+        if action == "disconnect":
+            await run("nmcli", "device", "disconnect", current["path"] if current else device.get("GENERAL.DEVICE", ""), timeout=15)
+            return {"done": True, "state": "desconectado"}
+        if action != "connect":
+            raise BackendError("invalid", "Operação Wi-Fi desconhecida.")
+        selected = next((item for item in networks if item["path"] == p.get("path")), None)
+        if selected is None:
+            raise BackendError("invalid", "Selecione uma rede Wi-Fi disponível.")
+        try:
+            await run(*wifi_connect_args(selected["ssid"], selected["known"]), timeout=60)
+        except BackendError as error:
+            if error.code == "failed" and selected["security"] == "protegida":
+                raise BackendError("secret_agent_required", "Nenhum agente de segredos do NetworkManager respondeu.") from None
+            raise
+        return {"done": True, "state": "conectando", "ssid": selected["ssid"], "connectivity": connectivity}
+
+    async def wifi(self, action, p):
+        try:
+            import dbus_next  # noqa: F401
+        except ImportError:
+            return await self.wifi_nmcli(action, p)
+        name = "org.freedesktop.NetworkManager"
+        manager = await self.interface(name, "/org/freedesktop/NetworkManager", name)
+        from dbus_next import Variant  # importable once interface() has found dbus-next
+        manager_props = await self.interface(name, "/org/freedesktop/NetworkManager", "org.freedesktop.DBus.Properties")
+        try:
+            connectivity = NM_CONNECTIVITY.get((await manager_props.call_get(name, "Connectivity")).value, "unknown")
+        except Exception:
+            connectivity = "unknown"
+        if action == "power":
+            powered = bool(p.get("powered", True))
+            await manager_props.call_set(name, "WirelessEnabled", Variant("b", powered))
+            return {"done": True, "powered": powered,
+                    "state": "procurando" if powered else "wifi_desativado"}
+
+        device_path = None
+        wifi_state_value = 0
+        ethernet_state = 0
+        for path in await manager.call_get_devices():
+            props = await self.interface(name, path, "org.freedesktop.DBus.Properties")
+            device_type = (await props.call_get(name + ".Device", "DeviceType")).value
+            device_state = (await props.call_get(name + ".Device", "State")).value
+            if device_type == 2:
+                device_path = path
+                wifi_state_value = device_state
+            elif device_type == 1:
+                ethernet_state = max(ethernet_state, device_state)
+        if device_path is None:
+            if ethernet_state == 100:
+                return {"available": True, "type": "cabo", "state": "cabo", "connectivity": connectivity,
+                        "powered": True, "ssid": None, "signal": None, "ip": None, "networks": []}
+            return {"available": True, "type": "nenhum", "state": "nm_indisponivel",
+                    "connectivity": connectivity, "powered": False, "ssid": None,
+                    "signal": None, "ip": None, "networks": []}
+        device = await self.interface(name, device_path, name + ".Device")
+        wireless = await self.interface(name, device_path, name + ".Device.Wireless")
+        device_props = await self.interface(name, device_path, "org.freedesktop.DBus.Properties")
+        powered = (await manager_props.call_get(name, "WirelessEnabled")).value
+        if action == "scan":
+            await wireless.call_request_scan({})
+            return {"accepted": True, "state": "procurando"}
+        if action == "disconnect":
+            if (await device_props.call_get(name + ".Device", "State")).value == 100:
+                await device.call_disconnect()
+            return {"done": True, "state": "desconectado"}
+
+        settings = await self.interface(name, "/org/freedesktop/NetworkManager/Settings", name + ".Settings")
+        profiles = {}
+        for path in await settings.call_list_connections():
+            connection = await self.interface(name, path, name + ".Settings.Connection")
+            try:
+                config = await connection.call_get_settings()
+            except Exception:
+                continue  # A system profile may be private to another user.
+            if config.get("connection", {}).get("type", Variant("s", "")).value != "802-11-wireless":
+                continue
+            ssid = bytes(config.get("802-11-wireless", {}).get("ssid", Variant("ay", b"")).value)
+            security = config.get("802-11-wireless-security", {}).get("key-mgmt")
+            profile_kind = "open" if security is None else "8021x" if security.value == "wpa-eap" else "secured"
+            profile_id = config.get("connection", {}).get("id", Variant("s", ssid.decode("utf-8", "replace"))).value
+            profiles[(ssid, profile_kind)] = {"path": path, "id": profile_id}
+
+        active_ap = (await device_props.call_get(name + ".Device.Wireless", "ActiveAccessPoint")).value
+        state = (await device_props.call_get(name + ".Device", "State")).value
+        powered = (await manager_props.call_get(name, "WirelessEnabled")).value
+        networks, rsn = {}, {}
+        for path in await wireless.call_get_all_access_points():
+            props = await self.interface(name, path, "org.freedesktop.DBus.Properties")
+            ap = await props.call_get_all(name + ".AccessPoint")
+            ssid = bytes(ap["Ssid"].value)
+            if not ssid:
+                continue
+            rsn[path] = ap["RsnFlags"].value
+            flags = ap["WpaFlags"].value | ap["RsnFlags"].value
+            kind = "8021x" if flags & 0x200 else "open" if not (ap["Flags"].value & 1 or flags) else "secured"
+            connected = path == active_ap and state == 100
+            network_name = ssid.decode("utf-8", "replace")
+            known = (ssid, kind) in profiles
+            network = {"path": path, "name": network_name, "ssid": network_name,
+                       "type": kind, "security": "aberta" if kind == "open" else "protegida",
+                       "connected": connected, "connecting": path == active_ap and wifi_state_value in (40, 50, 60, 70, 80, 90),
+                       "saved": known, "known": known, "signal": ap["Strength"].value}
+            key = (ssid, kind)
+            if key not in networks or connected or (not networks[key]["connected"] and network["signal"] > networks[key]["signal"]):
+                networks[key] = network
+        if action == "list":
+            current = next((n for n in networks.values() if n["connected"]), None)
+            local_ip = None
+            try:
+                raw_ip = await run("nmcli", "-t", "-f", "IP4.ADDRESS", "device", "show", timeout=5)
+                text = raw_ip.decode(errors="replace") if isinstance(raw_ip, bytes) else str(raw_ip)
+                local_ip = next((mask_local_ip(line.split(":", 1)[1]) for line in text.splitlines()
+                                 if ":" in line and line.split(":", 1)[1].strip()), None)
+            except BackendError:
+                pass
+            return {"networks": sorted(networks.values(), key=lambda n: (-n["connected"], -n["signal"], n["name"])),
+                    "type": "wifi", "state": wifi_state(state, powered, connectivity),
+                    "connectivity": connectivity, "powered": powered,
+                    "ssid": current["ssid"] if current else None,
+                    "signal": current["signal"] if current else None, "ip": local_ip}
+
+        path = p.get("path", "")
+        network = next((n for n in networks.values() if n["path"] == path), None)
+        if network is None:
+            raise BackendError("invalid", "Select an available network.")
+        ssid = bytes((await (await self.interface(name, path, "org.freedesktop.DBus.Properties")).call_get(name + ".AccessPoint", "Ssid")).value)
+        profile = profiles.get((ssid, network["type"]))
+        if action == "forget":
+            if profile is None:
+                raise BackendError("invalid", "This network has no saved connection.")
+            connection = await self.interface(name, profile["path"], name + ".Settings.Connection")
+            await connection.call_delete()
+            return {"done": True}
+        if action != "connect":
+            raise BackendError("invalid", "Unknown wireless operation.")
+        if profile:
+            # The profile is known; ask NM to bring it up without ever handling
+            # its secret in this process.  The confirmation below is a fresh
+            # D-Bus read, not a success assumption from nmcli's exit code.
+            await run(*wifi_connect_args(profile["id"], True), timeout=60)
+            active_path = (await device_props.call_get(name + ".Device", "ActiveConnection")).value
+        else:
+            if network["type"] == "8021x":
+                raise BackendError("secret_agent_required", "O agente de segredos do NetworkManager precisa solicitar a credencial.")
+            try:
+                await run(*wifi_connect_args(network["name"], False), timeout=60)
+            except BackendError as error:
+                if error.code == "failed" and network["type"] != "open":
+                    raise BackendError("secret_agent_required", "Nenhum agente de segredos do NetworkManager respondeu.") from None
+                raise
+            active_path = (await device_props.call_get(name + ".Device", "ActiveConnection")).value
+        active_props = await self.interface(name, active_path, "org.freedesktop.DBus.Properties")
+        for _ in range(60):
+            state = (await active_props.call_get(name + ".Connection.Active", "State")).value
+            if state == 2:
+                confirmed = await self.wifi("list", {})
+                if confirmed.get("state") != "conectado":
+                    raise BackendError("failed", "O NetworkManager não confirmou a conexão Wi-Fi.")
+                return {"done": True, "state": "conectado", "ssid": confirmed.get("ssid"),
+                        "connectivity": confirmed.get("connectivity", "unknown")}
+            if state == 4:
+                raise BackendError("failed", "O NetworkManager não conseguiu conectar a rede.")
+            await asyncio.sleep(0.5)
+        raise BackendError("timeout", "Wi-Fi connection timed out.")
+
+    async def bluetooth_pair(self, p):
+        from dbus_next.service import ServiceInterface, method
+        from dbus_next import DBusError
+        objects = await self.objects("org.bluez")
+        path = p.get("path", "")
+        if path not in objects or "org.bluez.Device1" not in objects[path]:
+            raise BackendError("invalid", "Select an available Bluetooth device.")
+        backend = self
+
+        async def prompt(message, input_kind=""):
+            backend.pairing_reply = asyncio.get_running_loop().create_future()
+            emit("bluetooth.prompt", {"message": message, "input": input_kind})
+            try:
+                reply = await asyncio.wait_for(backend.pairing_reply, 90)
+                if not reply.get("accept"):
+                    raise DBusError("org.bluez.Error.Rejected", "Pairing rejected")
+                return str(reply.get("value", ""))
+            finally:
+                backend.pairing_reply = None
+                emit("bluetooth.prompt", None)
+
+        class Agent(ServiceInterface):
+            def __init__(self):
+                super().__init__("org.bluez.Agent1")
+            @method()
+            async def RequestPinCode(self, device: 'o') -> 's':
+                return await prompt("Enter the device PIN", "pin")
+            @method()
+            async def RequestPasskey(self, device: 'o') -> 'u':
+                value = await prompt("Enter the six-digit passkey", "passkey")
+                if not value.isdigit() or len(value) > 6:
+                    raise DBusError("org.bluez.Error.Rejected", "Invalid passkey")
+                return int(value)
+            @method()
+            async def RequestConfirmation(self, device: 'o', passkey: 'u'):
+                await prompt(f"Does the device show {passkey:06d}?")
+            @method()
+            async def RequestAuthorization(self, device: 'o'):
+                await prompt("Allow this device to pair?")
+            @method()
+            async def AuthorizeService(self, device: 'o', uuid: 's'):
+                await prompt("Allow the device to connect this service?")
+            @method()
+            def DisplayPinCode(self, device: 'o', pincode: 's'):
+                emit("bluetooth.prompt", {"message": "Enter PIN " + pincode + " on your device.", "input": ""})
+            @method()
+            def DisplayPasskey(self, device: 'o', passkey: 'u', entered: 'q'):
+                emit("bluetooth.prompt", {"message": f"Enter {passkey:06d} on your device ({entered}/6).", "input": ""})
+            @method()
+            def Cancel(self):
+                if backend.pairing_reply and not backend.pairing_reply.done():
+                    backend.pairing_reply.set_result({"accept": False})
+                emit("bluetooth.prompt", None)
+            @method()
+            def Release(self):
+                self.Cancel()
+        async with self.pairing_lock:
+            manager = await self.interface("org.bluez", "/org/bluez", "org.bluez.AgentManager1")
+            # Pairing waits for the user to confirm; only the request's own limit applies.
+            device = await self.interface("org.bluez", path, "org.bluez.Device1", timeout=None)
+            agent_path = "/org/nekrypta/BluetoothAgent"
+            self.bus.export(agent_path, Agent())
+            registered = False
+            try:
+                await manager.call_register_agent(agent_path, "KeyboardDisplay")
+                registered = True
+                await device.call_pair()
+                await device.call_connect()
+            finally:
+                try:
+                    if registered:
+                        await manager.call_unregister_agent(agent_path)
+                finally:
+                    self.bus.unexport(agent_path)
+                    emit("bluetooth.prompt", None)
+            return {"done": True}
+
+    BACKLIGHT = Path("/sys/class/backlight")
+
+    def brightness(self):
+        """The built-in panel's backlight, or {"available": False} on machines without one."""
+        def preference(device):
+            # Firmware (ACPI) and platform interfaces drive the real panel; "raw" GPU devices and
+            # acpi_video stand-ins are the fallback, as in the kernel's own backlight selection.
+            try:
+                kind = (device / "type").read_text().strip()
+            except OSError:
+                kind = ""
+            return ({"firmware": 0, "platform": 1, "raw": 2}.get(kind, 3), device.name)
+        for device in sorted(self.BACKLIGHT.glob("*"), key=preference):
+            try:
+                maximum = int((device / "max_brightness").read_text())
+                value = int((device / "brightness").read_text())
+                if maximum > 0:
+                    return {"available": True, "value": value / maximum, "device": device.name}
+            except (OSError, ValueError):
+                continue
+        return {"available": False}
+
+    async def dispatch(self, method, p):
+        if method == "capabilities":
+            return await self.capabilities()
+        if method == "settings.get":
+            return settings()
+        if method == "security.overview":
+            try:
+                return await asyncio.wait_for(self.security.overview(), OVERVIEW_DEADLINE)
+            except asyncio.TimeoutError:
+                return {"state": "unavailable", "checkedAt": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+                        "stale": True, "capabilities": {}, "data": {}, "reason": "timeout",
+                        "warnings": [{"code": "timeout", "message": "A verificação de segurança não respondeu no prazo."}]}
+            except security.SecurityError as error:
+                raise BackendError(error.code, error.message, error.retryable, error.details) from None
+        if method == "security.verify":
+            try:
+                return await self.security.verify(p.get("manual") is True)
+            except security.SecurityError as error:
+                raise BackendError(error.code, error.message, error.retryable, error.details) from None
+        if method == "security.activate":
+            try:
+                return await self.security.activate(p.get("country"), p.get("confirm"))
+            except security.SecurityError as error:
+                raise BackendError(error.code, error.message, error.retryable, error.details) from None
+            except mullvad.MullvadError as error:
+                raise BackendError(error.code, error.message) from None
+        if method == "security.deactivate":
+            try:
+                return await self.security.deactivate(p.get("confirm"))
+            except security.SecurityError as error:
+                raise BackendError(error.code, error.message, error.retryable, error.details) from None
+            except mullvad.MullvadError as error:
+                raise BackendError(error.code, error.message) from None
+        if method == "security.dns.audit":
+            try:
+                return await self.security.dns_audit(p.get("external") is True)
+            except security.SecurityError as error:
+                raise BackendError(error.code, error.message, error.retryable, error.details) from None
+        if method == "security.ports.list":
+            try:
+                return await self.security.ports_list()
+            except security.SecurityError as error:
+                raise BackendError(error.code, error.message, error.retryable, error.details) from None
+        if method == "security.media.status":
+            try:
+                return await self.security.media_status()
+            except security.SecurityError as error:
+                raise BackendError(error.code, error.message, error.retryable, error.details) from None
+        if method == "security.media.revoke":
+            try:
+                return await self.security.media_revoke(p.get("id"), p.get("confirm"))
+            except security.SecurityError as error:
+                raise BackendError(error.code, error.message, error.retryable, error.details) from None
+        if method == "security.split.list":
+            try:
+                return await self.security.split_list()
+            except security.SecurityError as error:
+                raise BackendError(error.code, error.message, error.retryable, error.details) from None
+        if method == "security.lan.get":
+            try:
+                return await self.security.lan_get()
+            except security.SecurityError as error:
+                raise BackendError(error.code, error.message, error.retryable, error.details) from None
+        if method == "security.lan.set":
+            try:
+                return await self.security.lan_set(p.get("blocked"), p.get("confirm"))
+            except security.SecurityError as error:
+                raise BackendError(error.code, error.message, error.retryable, error.details) from None
+        if method == "security.status":
+            return await self.security_status()
+        if method == "security.enable":
+            try:
+                return await self.mullvad.enable(p.get("country"))
+            except mullvad.MullvadError as error:
+                raise BackendError(error.code, error.message) from None
+        if method == "security.restore":
+            try:
+                return await self.mullvad.restore(p.get("confirm"))
+            except mullvad.MullvadError as error:
+                raise BackendError(error.code, error.message) from None
+        if method == "security.relays":
+            try:
+                return await self.mullvad.relays()
+            except mullvad.MullvadError as error:
+                raise BackendError(error.code, error.message) from None
+        if method == "exposure.audit":
+            try:
+                return await exposure.audit()
+            except exposure.ExposureError as error:
+                raise BackendError(error.code, error.message) from None
+        if method == "visualizer.start":
+            try:
+                return await self.visualizer.start()
+            except visualizer.VisualizerError as error:
+                raise BackendError(error.code, error.message) from None
+        if method == "visualizer.stop":
+            try:
+                return await self.visualizer.stop()
+            except visualizer.VisualizerError as error:
+                raise BackendError(error.code, error.message) from None
+        if method == "visualizer.status":
+            return await self.visualizer.status()
+        if method == "settings.set":
+            changes = p.get("settings", p)
+            if not isinstance(changes, dict):
+                raise BackendError("invalid", "Settings must be an object.")
+            # The shell echoes every setting back: only the operational ones are kept, the fixed ones never change.
+            before = settings()["bluetoothAutoConnect"]
+            current = save_settings(changes)
+            added = [address for address in current["bluetoothAutoConnect"] if address not in before]
+            if added and self.bluetooth:
+                # A device just marked for auto-connect is tried straight away, even one disconnected by hand.
+                self.bluetooth.release(added)
+                self.bluetooth.trigger("auto-connect turned on")
+            return current
+        if method == "wallpaperscom.search":
+            try:
+                return await asyncio.to_thread(wallpaperscom.search, p.get("query", ""), p.get("page", 1), settings()["wallpaperDirectory"])
+            except Exception as exc:
+                raise BackendError("wallpaperscom", wallpaperscom.message(exc)) from None
+        if method == "wallpaperscom.download":
+            async with self.wallhaven_lock:
+                try:
+                    return await asyncio.to_thread(wallpaperscom.download, p.get("id", ""), p.get("url", ""), p.get("name", ""), settings()["wallpaperDirectory"])
+                except Exception as exc:
+                    raise BackendError("wallpaperscom", wallpaperscom.message(exc)) from None
+        if method == "media.art":
+            url = p.get("url")
+            if type(url) is not str or not url:
+                raise BackendError("invalid", "url must be a non-empty string.")
+            try:
+                return {"path": await asyncio.to_thread(art.local, url, CACHE / "art")}
+            except ValueError as exc:
+                raise BackendError("unavailable", str(exc)) from None
+            except OSError:
+                raise BackendError("failed", "The cover could not be downloaded.") from None
+        if method == "weather.get":
+            # The caller passes its location and units: settings are saved with a short delay.
+            async with self.weather_lock:
+                try:
+                    return await asyncio.to_thread(weather.forecast, p.get("location", {}), p.get("units", "metric"),
+                                                   CACHE / "weather.json", p.get("refresh") is True)
+                except Exception as exc:
+                    raise BackendError("weather", weather.message(exc)) from None
+        if method == "wallhaven.search":
+            try:
+                return await asyncio.to_thread(wallhaven.search, p.get("query", ""), p.get("page", 1), settings()["wallpaperDirectory"])
+            except Exception as exc:
+                raise BackendError("wallhaven", wallhaven.message(exc)) from None
+        if method == "wallhaven.download":
+            async with self.wallhaven_lock:
+                try:
+                    return await asyncio.to_thread(wallhaven.download, p.get("id", ""), settings()["wallpaperDirectory"])
+                except Exception as exc:
+                    raise BackendError("wallhaven", wallhaven.message(exc)) from None
+        if method == "wallpaper.list":
+            result = await asyncio.to_thread(wallpaper.catalog, settings()["wallpaperDirectory"], CACHE / "thumbs")
+            try:
+                result["active"] = await self.active_wallpapers()
+            except BackendError as exc:
+                result["active"] = {}
+                result["warning"] = exc.message
+            return result
+        if method == "wallpaper.active":
+            try:
+                return {"active": await self.active_wallpapers()}
+            except BackendError:
+                return {"active": {}}
+        if method == "wallpaper.apply":
+            async with self.wallpaper_lock:
+                result = await wallpaper.apply(run, p.get("path", ""), p.get("monitor", ""), BackendError, await self.wallpaper_daemon())
+                state_file = STATE / "wallpapers.json"
+                try:
+                    saved = json.loads(state_file.read_text())
+                    if not isinstance(saved, dict): saved = {}
+                except (OSError, ValueError):
+                    saved = {}
+                saved[result["monitor"]] = result["path"]
+                atomic_json(state_file, saved)
+                return result
+        if method == "wallpaper.restore":
+            # Also runs when outputs change: one already showing its wallpaper is left alone, and one
+            # that fails doesn't keep the others from being restored.
+            restored, failed = [], {}
+            try:
+                saved = json.loads((STATE / "wallpapers.json").read_text())
+            except (OSError, ValueError):
+                saved = {}
+            if not isinstance(saved, dict) or not saved:
+                return {"restored": restored, "failed": failed}
+            names = [monitor["name"] for monitor in json.loads((await run("hyprctl", "monitors", "-j")).decode())]
+            if not any(name in saved for name in names):
+                return {"restored": restored, "failed": failed}
+            daemon = await self.wallpaper_daemon()
+            async with self.wallpaper_lock:
+                # Read again under the lock so a completed user selection wins.
+                try:
+                    saved = json.loads((STATE / "wallpapers.json").read_text())
+                except (OSError, ValueError):
+                    saved = {}
+                if not isinstance(saved, dict): saved = {}
+                try:
+                    shown = await wallpaper.active(run, daemon)
+                except BackendError:
+                    shown = {}
+                for name in names:
+                    path = saved.get(name)
+                    if not isinstance(path, str) or not Path(path).is_file() or shown.get(name) == path:
+                        continue
+                    try:
+                        await wallpaper.apply(run, path, name, BackendError, daemon)
+                        restored.append(name)
+                    except BackendError as error:
+                        failed[name] = error.message
+            return {"restored": restored, "failed": failed}
+        if method in ("eq.apply", "eq.status"):
+            if method == "eq.apply":
+                self.eq_requests += 1  # the shell is in charge now; see resume_equalizer
+            async with self.eq_lock:
+                if method == "eq.apply":
+                    if type(p.get("enabled")) is not bool:
+                        raise BackendError("invalid", "Choose an equalizer state.")
+                    try:
+                        bands = equalizer.validate(p.get("bands"))
+                    except ValueError as error:
+                        raise BackendError("invalid", str(error)) from None
+                    await self.apply_equalizer(p["enabled"], bands)
+                return self.equalizer.status()
+        if method == "session.lockedHint":
+            # Tells logind (and hypridle) that the shell's lock screen is up.
+            if type(p.get("locked")) is not bool:
+                raise BackendError("invalid", "Lock state must be true or false.")
+            # One at a time, in the order sent: a slow lock must not land after the unlock that followed it.
+            async with self.lock_hint_lock:
+                session = await self.interface("org.freedesktop.login1", await self.session_path(), "org.freedesktop.login1.Session")
+                await session.call_set_locked_hint(p["locked"])
+            return {"locked": p["locked"]}
+        if method == "units.convert":
+            try:
+                return units.convert(p.get("query"))
+            except ValueError as error:
+                raise BackendError("invalid", str(error)) from None
+        if method == "files.search":
+            home = Path.home()
+            query = p.get("query")
+            output = await run(*file_search_args(query, home), timeout=3)
+            return {"results": file_results(output, query, home)}
+        if method == "calculator":
+            return calculate(p.get("expression", ""))
+        if method.startswith("wifi."):
+            action = method.split(".")[1]
+            if action == "connect":
+                if self.wifi_lock.locked():
+                    raise BackendError("busy", "A Wi-Fi connection is already in progress.")
+                async with self.wifi_lock:
+                    return await self.wifi(action, p)
+            if action == "list":
+                # Wired desktops and iwd/networkd setups have no NetworkManager Wi-Fi: say so as a
+                # state, not an error, so the shell hides Wi-Fi instead of reporting a failure.
+                try:
+                    return {"available": True, **await self.wifi(action, p)}
+                except BackendError as error:
+                    if error.code != "unavailable":
+                        raise
+                    reason = error.message
+                except Exception as error:
+                    # Only a NetworkManager that isn't on the bus means "no Wi-Fi here"; a timeout or other
+                    # one-off failure stays an error, so the shell keeps the state it last knew.
+                    if getattr(error, "type", "") not in ("org.freedesktop.DBus.Error.ServiceUnknown", "org.freedesktop.DBus.Error.NameHasNoOwner"):
+                        raise
+                    reason = "NetworkManager is not running."
+                return {"available": False, "reason": reason, "networks": [], "state": "nm_indisponivel",
+                        "type": "nenhum", "connectivity": "unknown", "ssid": None,
+                        "signal": None, "ip": None, "powered": False}
+            return await self.wifi(action, p)
+        if method.startswith("vpn."):
+            action = method.split(".")[1]
+            if action == "list":
+                try:
+                    return {"available": True, **await self.vpn(action, p)}
+                except BackendError as error:
+                    if error.code != "unavailable":
+                        raise
+                except Exception as error:
+                    if getattr(error, "type", "") not in ("org.freedesktop.DBus.Error.ServiceUnknown", "org.freedesktop.DBus.Error.NameHasNoOwner"):
+                        raise
+                return {"available": False, "connections": []}
+            if self.vpn_lock.locked():
+                raise BackendError("busy", "A VPN change is already in progress.")
+            async with self.vpn_lock:
+                return await self.vpn(action, p)
+        if method == "tray.quit":
+            if not isinstance(p.get("id"), str) or not p["id"] or not isinstance(p.get("title", ""), str):
+                raise BackendError("invalid", "Choose a tray app.")
+            pid = await tray_owner(self.session_call, p["id"], p.get("title", ""))
+            return await quit_process(pid)
+        if method == "bluetooth.pair":
+            return await self.bluetooth_pair(p)
+        if method in ("bluetooth.connect", "bluetooth.disconnect"):
+            path = p.get("path")
+            if not isinstance(path, str) or not re.fullmatch(r"/org/bluez/hci\d+/dev(_[0-9A-F]{2}){6}", path):
+                raise BackendError("invalid", "Select a Bluetooth device.")
+            address = path.rsplit("/dev_", 1)[1].replace("_", ":")
+            if self.bluetooth:
+                # A device disconnected by hand stays off until the next wake, login or Bluetooth start.
+                self.bluetooth.hold(address) if method == "bluetooth.disconnect" else self.bluetooth.release([address])
+            try:
+                await self.bluetooth_call(path, "Connect" if method == "bluetooth.connect" else "Disconnect")
+            except BackendError as error:
+                if method == "bluetooth.connect" and error.code != "unavailable":
+                    raise BackendError("failed", "Couldn't connect. Make sure the device is on and nearby.") from None
+                raise
+            return {"done": True}
+        if method == "bluetooth.reply":
+            if self.pairing_reply and not self.pairing_reply.done():
+                self.pairing_reply.set_result(p)
+            return {"done": True}
+        if method == "display.lid.get":
+            return {"enabled": self.lid_fd is not None}
+        if method == "display.lid.toggle":
+            async with self.lid_lock:
+                if self.lid_fd is not None:
+                    os.close(self.lid_fd)
+                    self.lid_fd = None
+                else:
+                    manager = await self.interface("org.freedesktop.login1", "/org/freedesktop/login1", "org.freedesktop.login1.Manager")
+                    fd = await manager.call_inhibit("handle-lid-switch", "NEKRYPTA", "Keep laptop awake with lid closed", "block")
+                    if not isinstance(fd, int) or fd < 0:
+                        raise BackendError("failed", "Could not keep the laptop awake.")
+                    os.set_inheritable(fd, False)
+                    self.lid_fd = fd
+                return {"enabled": self.lid_fd is not None}
+        if method in ("display.grayscale.get", "display.grayscale.toggle"):
+            shader = str(Path(__file__).resolve().parents[1] / "assets/grayscale.frag")
+            current = json.loads(await run("hyprctl", "getoption", "decoration:screen_shader", "-j"))["str"]
+            enabled = current == shader
+            if method.endswith(".toggle"):
+                saved = RUNTIME / "grayscale.json"
+                if enabled:
+                    try:
+                        previous = json.loads(saved.read_text()).get("previous", "")
+                    except (FileNotFoundError, ValueError):
+                        previous = ""
+                    target = previous
+                else:
+                    atomic_json(saved, {"previous": "" if current == "[[EMPTY]]" else current})
+                    target = shader
+                # Lua byte escapes preserve paths without allowing Lua code injection.
+                literal = '"' + ''.join(f'\\{byte:03d}' for byte in target.encode()) + '"'
+                result = (await run("hyprctl", "eval", 'hl.config({decoration = {screen_shader = ' + literal + '}})')).decode().strip()
+                if result != "ok":
+                    raise BackendError("failed", "Could not change the screen shader.")
+                actual = json.loads(await run("hyprctl", "getoption", "decoration:screen_shader", "-j"))["str"]
+                enabled = actual == shader
+            return {"enabled": enabled}
+        if method in ("keyboard.get", "keyboard.next"):
+            if method == "keyboard.next":
+                # Every keyboard, so an external one and the laptop's never disagree.
+                await run("hyprctl", "switchxkblayout", "all", "next")
+            return keyboard_state(json.loads(await run("hyprctl", "devices", "-j")))
+        if method == "brightness.get":
+            return self.brightness()
+        if method == "brightness.set":
+            value = number(p, "value", 0)
+            current = self.brightness()
+            if not current["available"]:
+                raise BackendError("unavailable", "No laptop backlight is available.")
+            device = current["device"]
+            await run("brightnessctl", "-d", device, "set", str(max(1, min(100, round(value * 100)))) + "%")
+            return self.brightness()
+        if method == "clipboard.write":
+            await run("wl-copy", data=str(p.get("text", "")).encode())
+            return {"done": True}
+        if method == "clipboard.thumbnail":
+            entry = str(p.get("entry", ""))
+            identity = entry.partition("\t")[0]
+            if not identity.isdigit() or "\n" in entry:
+                raise BackendError("invalid", "Select a clipboard entry.")
+            wipes = self.clipboard_wipes
+            data = await run("cliphist", "decode", data=entry.encode())
+            if identity in self.clipboard_deleted or wipes != self.clipboard_wipes:
+                return {"path": ""}
+            extension = ".png" if data.startswith(b"\x89PNG\r\n\x1a\n") else ".jpg" if data.startswith(b"\xff\xd8\xff") else None
+            if extension is None or len(data) > 20 * 1024 * 1024:
+                return {"path": ""}
+            folder = CACHE / "clipboard"
+            folder.mkdir(parents=True, exist_ok=True, mode=0o700)
+            for stale in sorted(folder.glob("*"), key=modified, reverse=True)[31:]:
+                stale.unlink(missing_ok=True)
+            path = folder / (identity + extension)
+            path.write_bytes(data)
+            path.chmod(0o600)
+            return {"path": str(path)}
+        if method == "notifications.get":
+            if not settings()["persistNotifications"]:
+                return {"entries": []}
+            try:
+                history = json.loads((STATE / "notifications.json").read_text())
+            except (OSError, ValueError):
+                history = []
+            cutoff = (time.time() - 7 * 86400) * 1000
+            return {"entries": [x for x in history if isinstance(x, dict) and x.get("timestamp", 0) > cutoff][:200]}
+        if method == "notifications.set":
+            path = STATE / "notifications.json"
+            if not settings()["persistNotifications"]:
+                path.unlink(missing_ok=True)
+                return {"done": True}
+            entries = p.get("entries", [])
+            if not isinstance(entries, list):
+                raise BackendError("invalid", "Expected notification entries.")
+            cutoff = (time.time() - 7 * 86400) * 1000
+            allowed = ("id", "summary", "body", "appName", "appIcon", "urgency", "timestamp")
+            atomic_json(path, [{k: x[k] for k in allowed if k in x} for x in entries[:200] if isinstance(x, dict) and x.get("timestamp", 0) > cutoff])
+            return {"done": True}
+        if method.startswith("power."):
+            # Some providers serve these properties but omit them from introspection.
+            # Read the standard Properties interface instead of generated accessors.
+            name = "net.hadess.PowerProfiles"
+            interface = await self.interface(name, "/net/hadess/PowerProfiles", "org.freedesktop.DBus.Properties")
+            properties = await interface.call_get_all(name)
+            available = [x["Profile"].value for x in properties["Profiles"].value if x["Profile"].value != "power-saver"]
+            if method == "power.set":
+                profile = p.get("profile")
+                if profile not in available:
+                    raise BackendError("invalid", "Select an available power profile.")
+                from dbus_next import Variant
+                await interface.call_set(name, "ActiveProfile", Variant("s", profile))
+                properties = await interface.call_get_all(name)
+            return {"active": properties["ActiveProfile"].value, "profiles": available}
+        if method == "clipboard.list":
+            data = (await run("cliphist", "list")).decode(errors="replace")
+            query = str(p.get("query", "")).casefold()
+            limit = min(1000, max(1, int(number(p, "limit", 100))))
+            entries = []
+            for line in data.splitlines():
+                identity, _, text = line.partition("\t")
+                if query in text.casefold():
+                    entry = {"id": identity, "text": text, "raw": line}
+                    label = clipboard_label(text)
+                    if label:
+                        entry["label"] = label
+                    entries.append(entry)
+                if len(entries) >= limit:
+                    break
+            paths = []
+            for entry in entries:
+                text = entry["text"].strip()
+                if "label" in entry:
+                    continue
+                if kind := clipboard_kind(text):
+                    entry.update(kind)
+                elif text.startswith(("/", "~/", "file://")) and not text.endswith("…"):
+                    paths.append((entry, text))
+            if paths:
+                try:
+                    kinds = await asyncio.wait_for(asyncio.to_thread(path_kinds, [text for _, text in paths]), 1)
+                except asyncio.TimeoutError:
+                    # A hung network mount must not hold up the list; paths just go unmarked.
+                    kinds = []
+                for (entry, _), kind in zip(paths, kinds):
+                    if kind:
+                        entry.update(kind)
+            return {"entries": entries}
+        if method in ("clipboard.copy", "clipboard.delete", "clipboard.open"):
+            entry = str(p.get("entry", ""))
+            if not entry.partition("\t")[0].isdigit() or "\n" in entry:
+                raise BackendError("invalid", "Select a clipboard entry.")
+            data = await run("cliphist", "delete" if method.endswith("delete") else "decode", data=entry.encode())
+            if method.endswith("delete"):
+                # The preview is a full copy of the image; it goes with the entry.
+                identity = entry.partition("\t")[0]
+                self.clipboard_deleted.add(identity)
+                for extension in (".png", ".jpg"):
+                    (CACHE / "clipboard" / (identity + extension)).unlink(missing_ok=True)
+            if method.endswith("open"):
+                # Previews are cut and flattened, so the full entry decides what opens.
+                try:
+                    text = data.decode().strip() if len(data) <= 65536 else ""
+                except UnicodeDecodeError:
+                    text = ""
+                try:
+                    target = await asyncio.wait_for(asyncio.to_thread(clipboard_target, text), 3)
+                except asyncio.TimeoutError:
+                    raise BackendError("failed", "That location isn't responding.")
+                if not target:
+                    raise BackendError("invalid", "This entry can't be opened.")
+                return target
+            if method.endswith("copy"):
+                await run("wl-copy", data=data)
+            return {"done": True}
+        if method == "clipboard.clear":
+            await run("cliphist", "wipe")
+            self.clipboard_wipes += 1
+            shutil.rmtree(CACHE / "clipboard", ignore_errors=True)
+            return {"done": True}
+        if method == "color.pick":
+            value = (await run("hyprpicker", "--format", "hex", timeout=120, cancel_ok=True)).decode().strip()
+            await run("wl-copy", data=value.encode())
+            return {"color": value}
+        if method == "system.sample":
+            return await self.sysmon.sample(nvidia=p.get("nvidia") is True, history=p.get("history") is True)
+        if method == "system.telemetry":
+            sample = await self.sysmon.sample(history=False)
+            return telemetry_projection(sample)
+        if method == "capture.screenshot":
+            async with self.capture_lock:
+                return await self.screenshot(p)
+        if method.startswith("capture.record."):
+            action = method.rsplit(".", 1)[1]
+            if action == "start":
+                async with self.capture_lock:
+                    return await self.record(action, p)
+            return await self.record(action, p)
+        raise BackendError("invalid", "Unknown backend method.")
+
+    async def geometry(self, mode):
+        if mode == "region":
+            return ["-g", (await run("slurp", timeout=120, cancel_ok=True)).decode().strip()]
+        if mode == "window":
+            window = json.loads(await run("hyprctl", "-j", "activewindow"))
+            if not window.get("at") or not window.get("size"):
+                raise BackendError("unavailable", "No active window.")
+            x, y = window["at"]
+            w, h = window["size"]
+            return ["-g", f"{x},{y} {w}x{h}"]
+        if mode == "output":
+            outputs = json.loads(await run("hyprctl", "-j", "monitors"))
+            output = next((x for x in outputs if x.get("focused")), None)
+            if not output:
+                raise BackendError("unavailable", "No focused output.")
+            return ["-o", output["name"]]
+        raise BackendError("invalid", "Choose region, output, or window capture.")
+
+    async def screenshot(self, p):
+        await asyncio.sleep(min(10, max(0.2, number(p, "delay", 0.2))))
+        args = await self.geometry(p.get("mode", "region"))
+        folder = Path(settings()["screenshotDirectory"]).expanduser()
+        folder.mkdir(parents=True, exist_ok=True)
+        path = folder / (datetime.datetime.now().strftime("Screenshot-%Y%m%d-%H%M%S-%f") + ".png")
+        await run("grim", *args, str(path))
+        copied = False
+        if p.get("copy", True):
+            # The saved file is the result; the clipboard copy is a convenience that may be missing.
+            try:
+                await run("wl-copy", "--type", "image/png", data=path.read_bytes())
+                copied = True
+            except BackendError:
+                pass
+        return {"path": str(path), "copied": copied}
+
+    async def record(self, action, p):
+        RUNTIME.mkdir(parents=True, exist_ok=True, mode=0o700)
+        state_path = RUNTIME / "recording.json"
+        try:
+            state = json.loads(state_path.read_text())
+            alive = Path(f"/proc/{state['pid']}/cmdline").read_bytes()
+            active = b"record-worker" in alive and b"backend.py" in alive
+        except (OSError, ValueError, KeyError):
+            state, active = {}, False
+        if action == "status":
+            return {**state, "active": active}
+        if action == "stop":
+            if active:
+                os.kill(state["pid"], signal.SIGTERM)
+                for _ in range(50):
+                    await asyncio.sleep(0.1)
+                    try:
+                        latest = json.loads(state_path.read_text())
+                        if not latest.get("active", False):
+                            return latest
+                    except (OSError, ValueError):
+                        pass
+                raise BackendError("timeout", "Recording is still finalizing. Check status before starting another recording.")
+            return {**state, "active": False}
+        if action != "start":
+            raise BackendError("invalid", "Unknown recording operation.")
+        if active:
+            raise BackendError("busy", "A recording is already running.")
+        if not shutil.which("wf-recorder"):
+            raise BackendError("unavailable", "Install wf-recorder to record the screen.")
+        audio = record_audio(p.get("audio", "none"))
+        args = await self.geometry(p.get("mode", "output"))
+        folder = Path(settings()["recordingDirectory"]).expanduser()
+        folder.mkdir(parents=True, exist_ok=True)
+        path = folder / (datetime.datetime.now().strftime("Recording-%Y%m%d-%H%M%S-%f") + ".mp4")
+        command = ["wf-recorder", *args, "-f", str(path)]
+        if RECORD_AUDIO[audio]:
+            command.append("--audio=" + RECORD_AUDIO[audio])
+        # A detached process would remain in the shell's systemd cgroup and die
+        # on restart. Give recording its own transient user unit instead.
+        unit = ["systemd-run", "--user", "--quiet", "--collect", "--unit=nekrypta-recording",
+                "--property=PartOf=graphical-session.target", "--property=KillMode=mixed", "--property=TimeoutStopSec=15"]
+        for key in ("WAYLAND_DISPLAY", "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS", "HYPRLAND_INSTANCE_SIGNATURE"):
+            if os.environ.get(key):
+                unit.append("--setenv=" + key + "=" + os.environ[key])
+        await run(*unit, sys.executable, str(Path(__file__).resolve()), "record-worker", json.dumps(command), str(path))
+        for _ in range(30):
+            await asyncio.sleep(0.1)
+            try:
+                current = json.loads(state_path.read_text())
+                if current.get("path") == str(path):
+                    if current.get("active"):
+                        return current
+                    raise BackendError("failed", "Recorder failed to start. See journalctl --user -u nekrypta-recording.")
+            except (OSError, ValueError):
+                pass
+        raise BackendError("timeout", "Recorder startup is taking longer than expected. Check recording status.")
+
+def record_worker(command, path):
+    """Own the recorder independently of the QML/UI process, and finalize on stop."""
+    import fcntl
+    RUNTIME.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with (RUNTIME / "recording.lock").open("w") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return 1
+        child = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        state = {"pid": os.getpid(), "path": path, "started": time.time(), "active": True}
+        def stop(*_):
+            if child.poll() is None:
+                child.send_signal(signal.SIGINT)
+        signal.signal(signal.SIGTERM, stop)
+        signal.signal(signal.SIGINT, stop)
+        atomic_json(RUNTIME / "recording.json", state)
+        code = child.wait()
+        atomic_json(RUNTIME / "recording.json", {**state, "active": False, "saved": Path(path).is_file() and Path(path).stat().st_size > 0})
+        return code
+
+async def keep_clipboard_history(clipboard, interval=30):
+    # Re-checks so a watcher the user starts later wins, and a crashed one of ours comes back.
+    while True:
+        try:
+            clipboard.ensure()
+        except OSError as error:
+            print("Clipboard history: could not start a watcher:", error.strerror or error, file=sys.stderr, flush=True)
+        await asyncio.sleep(interval)
+
+async def keep_system_history(backend):
+    """Keeps the system monitor's graphs going while its panel is closed."""
+    reported = False
+    while True:
+        await asyncio.sleep(2)
+        if backend.session_locked or backend.session_sleeping:
+            continue
+        try:
+            await backend.sysmon.tick()
+        except Exception as error:
+            if not reported:
+                log_unexpected(error, "System history")
+                reported = True
+
+class BacklightWatch:
+    """Calls `changed` when the kernel announces a new brightness for a backlight. Every change made through
+    sysfs (brightnessctl, logind) or by brightness hotkeys is announced on actual_brightness."""
+    def __init__(self, device, changed):
+        self.device, self.changed, self.closed, self.poll = device, changed, False, None
+        self.file = open(device / "actual_brightness", "rb", buffering=0)
+        try:
+            self.file.read()  # a sysfs file's notice is armed by reading it
+            self.poll = select.epoll()
+            self.poll.register(self.file.fileno(), select.EPOLLPRI | select.EPOLLERR)
+            asyncio.get_running_loop().add_reader(self.poll.fileno(), self.ready)
+        except BaseException:
+            if self.poll:
+                self.poll.close()
+            self.file.close()
+            raise
+
+    def ready(self):
+        try:
+            self.poll.poll(0)
+            # Reading again re-arms the notice; without it the file stays ready and this would spin.
+            self.file.seek(0)
+            self.file.read()
+        except OSError:
+            self.close()  # the device went away; the watcher looks for it again
+        self.changed()
+
+    def close(self):
+        if self.closed:
+            return
+        self.closed = True
+        asyncio.get_running_loop().remove_reader(self.poll.fileno())
+        self.poll.close()
+        self.file.close()
+
+
+async def watch_brightness(backend, recheck=10, poll=1, unavailable=30):
+    """Reports the backlight level as it changes: on the kernel's notice where it gives one, otherwise by
+    polling every `poll` seconds. The slow `recheck` covers drivers that change it without a notice."""
+    previous, watch, changed = None, None, asyncio.Event()
+    try:
+        while True:
+            value = backend.brightness()
+            if value != previous:
+                emit("brightness", {**value, "initial": previous is None})
+                previous = value
+            device = backend.BACKLIGHT / value["device"] if value["available"] else None
+            if watch and (watch.closed or watch.device != device):
+                watch.close()
+                watch = None
+            if device and not watch:
+                try:
+                    watch = BacklightWatch(device, changed.set)
+                except OSError:
+                    pass
+            changed.clear()
+            # Machines without a backlight rarely gain one; check far less often.
+            delay = recheck if watch else poll if device else unavailable
+            try:
+                await asyncio.wait_for(changed.wait(), delay)
+            except asyncio.TimeoutError:
+                pass
+    finally:
+        if watch:
+            watch.close()
+
+
+async def watch_with_retries(name, setup, delays=(5, 10, 30, 60, 120, 300)):
+    """Sets up a D-Bus watch, again after each delay while it fails: the service may start after the shell."""
+    for delay in (0, *delays):
+        await asyncio.sleep(delay)
+        try:
+            return await setup()
+        except BackendError as error:
+            print(f"{name}: {error.message}", file=sys.stderr, flush=True)
+            if error.code != "timeout":
+                return  # no python-dbus-next or no logind session: trying again won't help
+        except Exception as error:
+            if getattr(error, "type", "") not in SERVICE_MISSING:
+                log_unexpected(error, name)
+
+async def main():
+    backend = Backend()
+    tasks = set()
+    # Recovery of a protected session runs beside request handling: readers wait on it inside security.status,
+    # which has its own deadline, instead of the helper not reading requests at all meanwhile.
+    recovery = asyncio.create_task(backend.mullvad.recover())
+    async def watch_session():
+        """Follows external locks and sleep: the system monitor pauses and Bluetooth reconnects after them."""
+        manager = await backend.interface("org.freedesktop.login1", "/org/freedesktop/login1", "org.freedesktop.login1.Manager")
+        path = await backend.session_path()
+        props = await backend.interface("org.freedesktop.login1", path, "org.freedesktop.DBus.Properties")
+        backend.session_locked = bool((await props.call_get("org.freedesktop.login1.Session", "LockedHint")).value)
+        def on_properties(interface, changed, _invalidated):
+            if interface == "org.freedesktop.login1.Session" and "LockedHint" in changed:
+                was_locked = backend.session_locked
+                backend.session_locked = bool(changed["LockedHint"].value)
+                if was_locked and not backend.session_locked and backend.bluetooth:
+                    backend.bluetooth.trigger("unlocked")
+        def on_sleep(sleeping):
+            backend.session_sleeping = bool(sleeping)
+            if not sleeping:
+                emit("session.resumed", {})
+            if not sleeping and backend.bluetooth:
+                backend.bluetooth.trigger("woke from sleep", fresh=True)
+        props.on_properties_changed(on_properties)
+        manager.on_prepare_for_sleep(on_sleep)
+    async def watch_power():
+        """Report power-mode changes made anywhere (shell, powerprofilesctl, battery rules of the provider).
+        Until it works, the shell keeps polling on its power page."""
+        props = await backend.interface("net.hadess.PowerProfiles", "/net/hadess/PowerProfiles", "org.freedesktop.DBus.Properties")
+        def on_properties(interface, changed, _invalidated):
+            if "ActiveProfile" in changed:
+                emit("power.profile", {"active": changed["ActiveProfile"].value})
+        props.on_properties_changed(on_properties)
+    async def handle(line):
+        identity = method = None
+        try:
+            request = json.loads(line)
+            identity = request.get("id")
+            method, params = request.get("method"), request.get("params", {})
+            if not isinstance(method, str) or not isinstance(params, dict):
+                raise BackendError("invalid", "Expected a method string and params object.")
+            result = await asyncio.wait_for(backend.dispatch(method, params), timeout=150)
+            response = {"id": identity, "ok": True, "result": result}
+        except BackendError as error:
+            payload = {"code": error.code, "message": error.message}
+            if error.retryable:
+                payload["retryable"] = True
+            if error.details:
+                payload["details"] = error.details
+            response = {"id": identity, "ok": False, "error": payload}
+        except asyncio.TimeoutError:
+            response = {"id": identity, "ok": False, "error": {"code": "timeout", "message": "The operation timed out."}}
+        except Exception as error:
+            # D-Bus exception text can contain credentials or device data: expose only its stable type.
+            error_type = str(getattr(error, "type", ""))
+            code = "permission" if "AccessDenied" in error_type else "failed"
+            message = "The operation failed. Check service availability and permissions."
+            if "ServiceUnknown" in error_type or "NameHasNoOwner" in error_type:
+                code, message = "unavailable", "The required system service is not running."
+            elif "InvalidKey" in error_type or "AuthenticationFailed" in error_type:
+                code, message = "authentication", "Authentication failed. Check the password and try again."
+            elif "Canceled" in error_type or "Cancelled" in error_type:
+                code, message = "cancelled", "Action cancelled."
+            if code == "failed":
+                log_unexpected(error, method if isinstance(method, str) else "Request")
+            response = {"id": identity, "ok": False, "error": {"code": code, "message": message}}
+        print(json.dumps(response, ensure_ascii=False), flush=True)
+
+    async def keep_equalizer():
+        backend.equalizer.reap_stale()
+        # PipeWire may still be starting with the session: a few attempts over about 30 seconds.
+        if not await backend.resume_equalizer((0, 2, 4, 8, 16)):
+            emit("eq", backend.equalizer.status())
+        while True:
+            await asyncio.sleep(5)
+            await backend.check_equalizer()
+
+    clipboard = clipboard_watch.ClipboardWatcher()
+
+    def terminate():
+        # The filter is a separate PipeWire client; do not leave it running without the shell.
+        backend.equalizer.stop()
+        clipboard.stop()
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
+        os.kill(os.getpid(), signal.SIGTERM)
+
+    asyncio.get_running_loop().add_signal_handler(signal.SIGTERM, terminate)
+    watcher = asyncio.create_task(watch_brightness(backend))
+    equalizer_keeper = asyncio.create_task(keep_equalizer())
+    session_watcher = asyncio.create_task(watch_with_retries("Session watch", watch_session))
+    power_watcher = asyncio.create_task(watch_with_retries("Power profile watch", watch_power))
+    bluetooth_watcher = asyncio.create_task(watch_with_retries("Bluetooth watch", backend.watch_bluetooth))
+    clipboard_keeper = asyncio.create_task(keep_clipboard_history(clipboard))
+    system_keeper = asyncio.create_task(keep_system_history(backend))
+    reader = asyncio.StreamReader(limit=1024 * 1024 + 1)
+    transport, _ = await asyncio.get_running_loop().connect_read_pipe(lambda: asyncio.StreamReaderProtocol(reader), sys.stdin)
+    try:
+        while True:
+            line = await read_request(reader)
+            if not line:
+                break
+            if isinstance(line, tuple):
+                print(json.dumps({"id": line[1], "ok": False, "error": {"code": "invalid", "message": "Request is too large."}}), flush=True)
+                continue
+            if len(tasks) >= 32:
+                await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+            task = asyncio.create_task(handle(line))
+            tasks.add(task)
+            task.add_done_callback(tasks.discard)
+        if tasks:
+            await asyncio.gather(*tasks)
+    finally:
+        recovery.cancel()
+        watcher.cancel()
+        session_watcher.cancel()
+        power_watcher.cancel()
+        bluetooth_watcher.cancel()
+        if backend.bluetooth:
+            backend.bluetooth.stop()
+        clipboard_keeper.cancel()
+        system_keeper.cancel()
+        equalizer_keeper.cancel()
+        backend.equalizer.stop()
+        clipboard.stop()
+        await backend.close()
+        transport.close()
+    if backend.bus:
+        backend.bus.disconnect()
+
+if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "record-worker":
+        sys.exit(record_worker(json.loads(sys.argv[2]), sys.argv[3]))
+    asyncio.run(main())

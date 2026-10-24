@@ -1,0 +1,457 @@
+import QtQuick
+import QtQuick.Layouts
+import Quickshell.Io
+import "../core"
+import "../components" as C
+import "../core/i18n.js" as I18n
+
+FocusScope {
+    id: root
+    readonly property string title: I18n.t("Wallpapers")
+    // Draws its own surface edge to edge.
+    readonly property bool chromeless: true
+    readonly property int panelWidth: 1180
+    readonly property int panelHeight: 570
+    property var entries: []
+    readonly property var activeWallpapers: ShellState.activeWallpapers
+    property bool localLoading: false
+    property bool onlineLoading: false
+    property string sourceMode: "local"
+    property bool switchingSource: false
+    property string localQuery: ""
+    property var sourceStates: ({})
+    property var onlineEntries: []
+    property int onlinePage: 0
+    property int onlineGeneration: 0
+    property bool hasMore: false
+    readonly property bool online: sourceMode !== "local"
+    readonly property string sourceName: sourceMode === "wallpaperscom" ? "Wallpapers.com" : "Wallhaven"
+    readonly property bool loading: online ? onlineLoading : localLoading
+    readonly property bool applying: ShellState.wallpaperBusy || ShellState.wallpaperDownloading
+    property string error: ""
+    property string directory: ""
+    // The helper lists at most 500 local wallpapers; set to that count when it stopped short.
+    property int listedCount: 0
+    property int selected: 0
+    property int generation: 0
+    readonly property var filtered: online ? onlineEntries : entries.filter(e => (e.name + " " + e.file).toLowerCase().indexOf(search.text.toLowerCase().trim()) >= 0)
+    readonly property var current: selected >= 0 && selected < filtered.length ? filtered[selected] : null
+    readonly property string monitor: ShellState.screenName || ShellState.targetScreen()
+    readonly property string activePath: activeWallpapers[monitor] || ""
+    readonly property bool isCurrent: !!current && !!current.path && current.path === activePath
+    IpcHandler {
+        target: "wallpaper-picker"
+        function status(): string {
+            return JSON.stringify({count: root.filtered.length, selected: root.selected, path: root.current ? root.current.path : "", activePath: root.activePath, monitor: root.monitor, busy: root.applying, transitionMs: Theme.enter, loading: root.loading, error: ShellState.wallpaperError || root.error});
+        }
+        function select(index: int): void {
+            if (!root.applying) root.selected = Math.max(0, Math.min(root.filtered.length - 1, index));
+        }
+        function apply(): void { root.apply(); }
+    }
+    function switchSourceWithTab() {
+        if (applying) return;
+        if (sourceMode === "wallhaven") {
+            chooseSource("wallpaperscom");
+        } else if (sourceMode === "wallpaperscom") {
+            chooseSource("local");
+        } else {
+            // Preserve the original shortcut to Wallhaven's popular feed.
+            const states = Object.assign({}, sourceStates);
+            delete states.wallhaven;
+            sourceStates = states;
+            chooseSource("wallhaven");
+        }
+        root.forceActiveFocus();
+    }
+    Shortcut {
+        sequence: "Tab"
+        context: Qt.WindowShortcut
+        autoRepeat: false
+        enabled: root.visible && ShellState.panel === "wallpaper"
+        onActivated: root.switchSourceWithTab()
+    }
+    function chooseSource(mode) {
+        if (sourceMode === mode || applying) return;
+        if (online) {
+            const states = Object.assign({}, sourceStates);
+            states[sourceMode] = {query: search.text, entries: onlineEntries,
+                page: onlinePage, hasMore: hasMore, selected: selected, error: error};
+            sourceStates = states;
+        }
+        else localQuery = search.text;
+        ++onlineGeneration;
+        onlineLoading = false;
+        onlineDebounce.stop();
+        switchingSource = true;
+        sourceMode = mode;
+        const state = sourceStates[mode];
+        onlineEntries = state ? state.entries : [];
+        onlinePage = state ? state.page : 0;
+        hasMore = state ? state.hasMore : false;
+        search.text = online ? (state ? state.query : "") : localQuery;
+        switchingSource = false;
+        selected = state ? state.selected : 0;
+        error = state ? state.error : "";
+        ShellState.wallpaperError = "";
+        if (online && !onlineEntries.length) searchOnline(false);
+    }
+    function searchOnline(append) {
+        if (!online || (append && (!hasMore || onlineLoading))) return;
+        if (!Backend.ready) {
+            onlineLoading = false;
+            error = I18n.t("Wallpaper service is reconnecting…");
+            return;
+        }
+        onlineDebounce.stop();
+        const request = ++onlineGeneration;
+        const page = append ? onlinePage + 1 : 1;
+        onlineLoading = true;
+        error = "";
+        Backend.request(sourceMode + ".search", {query: search.text.trim(), page: page}, (result, failure) => {
+            if (request !== onlineGeneration) return;
+            onlineLoading = false;
+            if (failure) { error = I18n.error(failure); return; }
+            error = result.warning || "";
+            const position = selected;
+            onlineEntries = append ? onlineEntries.concat(result.entries.filter(item => !onlineEntries.some(old => old.id === item.id))) : result.entries;
+            onlinePage = result.page;
+            hasMore = result.hasMore;
+            selected = append ? position : 0;
+        });
+    }
+    function refresh() {
+        if (!Backend.ready) return;
+        const request = ++generation;
+        localLoading = true;
+        if (!online) error = "";
+        Backend.request("wallpaper.list", {}, (r, e) => {
+            if (request !== generation) return;
+            localLoading = false;
+            if (e) { if (!online) error = I18n.error(e); return; }
+            const previous = root.current ? root.current.path : "";
+            entries = r.entries;
+            directory = r.directory;
+            listedCount = r.limited === true ? r.entries.length : 0;
+            ShellState.activeWallpapers = r.active || {};
+            if (!online) error = r.warning || "";
+            if (!online) {
+                const preferred = filtered.findIndex(item => item.path === (previous || activePath));
+                selected = Math.max(0, preferred);
+            }
+        });
+    }
+    function move(delta) {
+        if (filtered.length && !applying)
+            selected = Math.max(0, Math.min(filtered.length - 1, selected + delta));
+    }
+    function apply() {
+        if (current && !isCurrent && !applying)
+            ShellState.applyWallpaper(current, activePath);
+    }
+    Component.onCompleted: refresh()
+    Connections {
+        target: Backend
+        function onReadyChanged() {
+            if (Backend.ready) {
+                root.refresh();
+                if (root.online) root.searchOnline(false);
+            }
+        }
+    }
+    Connections {
+        target: ShellState
+        function onWallpaperSaved(entry) {
+            const markSaved = item => (item.provider || "wallhaven") === (entry.provider || "wallhaven") && item.id === entry.id ? Object.assign({}, item, {path: entry.path}) : item;
+            root.onlineEntries = root.onlineEntries.map(markSaved);
+            const states = Object.assign({}, root.sourceStates);
+            for (const provider of Object.keys(states))
+                states[provider] = Object.assign({}, states[provider], {entries: states[provider].entries.map(markSaved)});
+            root.sourceStates = states;
+            if (!root.entries.some(item => item.path === entry.path))
+                root.entries = root.entries.concat([Object.assign({}, entry, {remote: false})]);
+        }
+    }
+    onFilteredChanged: selected = Math.max(0, Math.min(selected, filtered.length - 1))
+    onSelectedChanged: if (!applying) ShellState.wallpaperError = ""
+    ColumnLayout {
+        anchors.fill: parent
+        spacing: Theme.sectionSpacing
+        Rectangle {
+            Layout.alignment: Qt.AlignHCenter
+            Layout.preferredWidth: Math.min(root.width, 680)
+            Layout.preferredHeight: 142
+            color: Theme.panel
+            radius: Theme.panelRadius
+            border.width: 1
+            border.color: Theme.border
+            ColumnLayout {
+                anchors.fill: parent
+                anchors.margins: Theme.gapM
+                spacing: Theme.gapS
+                RowLayout {
+                    Layout.fillWidth: true
+                    spacing: Theme.gapS
+                    C.Label { text: I18n.t("Wallpapers"); font.weight: Font.DemiBold; font.pixelSize: Theme.titleSize; Layout.fillWidth: true; Layout.leftMargin: Theme.gapXs }
+                    C.Label {
+                        visible: root.loading && root.filtered.length > 0
+                        text: I18n.t("Updating…")
+                        color: Theme.muted
+                        font.pixelSize: Theme.caption
+                    }
+                    C.Button { glyph: "close"; flat: true; hint: I18n.t("Close"); implicitHeight: 30; onClicked: ShellState.close() }
+                }
+                C.Segmented {
+                    Layout.fillWidth: true
+                    segmentHeight: 34
+                    enabled: !root.applying
+                    model: [{key: "local", text: I18n.t("My wallpapers")}, {key: "wallhaven", text: "Wallhaven"}, {key: "wallpaperscom", text: "Wallpapers.com"}]
+                    current: root.sourceMode
+                    onActivated: key => root.chooseSource(key)
+                }
+                RowLayout {
+                    Layout.fillWidth: true
+                    spacing: Theme.gapS
+                    C.Field {
+                        id: search
+                        Layout.fillWidth: true
+                        implicitHeight: 40
+                        enabled: !root.applying
+                        placeholderText: root.online ? I18n.t("Search ") + root.sourceName + "…" : I18n.t("Search your wallpapers…")
+                        onTextChanged: {
+                            if (root.switchingSource) return;
+                            root.selected = 0;
+                            if (root.online) {
+                                ++root.onlineGeneration;
+                                root.onlineEntries = [];
+                                root.onlinePage = 0;
+                                root.hasMore = false;
+                                root.onlineLoading = true;
+                                onlineDebounce.restart();
+                            }
+                        }
+                        Keys.onDownPressed: root.move(1)
+                        Keys.onUpPressed: root.move(-1)
+                        onAccepted: root.online ? root.searchOnline(false) : root.apply()
+                    }
+                    C.Button {
+                        glyph: root.online ? "search" : "refresh"
+                        flat: true
+                        hint: root.online ? I18n.t("Search ") + root.sourceName : I18n.t("Refresh wallpapers")
+                        enabled: !root.applying && !root.loading
+                        onClicked: root.online ? root.searchOnline(false) : root.refresh()
+                    }
+                }
+            }
+        }
+        Item {
+            id: gallery
+            Layout.fillWidth: true
+            Layout.fillHeight: true
+            clip: true
+            readonly property real cardWidth: Math.min(510, width * (width < 650 ? 0.72 : 0.49))
+            readonly property real cardHeight: Math.max(0, Math.min(320, height - 24))
+            Repeater {
+                model: root.filtered
+                Item {
+                    id: tile
+                    required property var modelData
+                    required property int index
+                    readonly property int distance: index - root.selected
+                    width: gallery.cardWidth
+                    height: gallery.cardHeight
+                    x: (gallery.width - width) / 2 + distance * width * 0.94
+                    y: (gallery.height - height) / 2 + (distance === 0 ? 0 : 10)
+                    scale: distance === 0 ? 1 : 0.83
+                    opacity: Math.abs(distance) > 2 ? 0 : distance === 0 ? 1 : 0.76
+                    visible: opacity > 0.001
+                    z: 10 - Math.abs(distance)
+                    Behavior on x { NumberAnimation { duration: Math.min(Theme.enter, 170); easing.type: Easing.OutCubic } }
+                    Behavior on y { NumberAnimation { duration: Math.min(Theme.enter, 170); easing.type: Easing.OutCubic } }
+                    Behavior on scale { NumberAnimation { duration: Math.min(Theme.enter, 170); easing.type: Easing.OutCubic } }
+                    Behavior on opacity { NumberAnimation { duration: Theme.fast } }
+                    transform: Matrix4x4 {
+                        matrix: Qt.matrix4x4(1, -0.10, 0, tile.height * 0.05, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1)
+                    }
+                    Rectangle {
+                        anchors.fill: parent
+                        color: Theme.surface
+                        border.width: 2
+                        border.color: tile.distance === 0 ? Theme.accent : Theme.border
+                        Behavior on border.color { ColorAnimation { duration: Theme.fast } }
+                        radius: 5
+                        clip: true
+                        Image {
+                            id: thumbnail
+                            // A local wallpaper's small copy once it exists (see wallpaper.catalog). The first time,
+                            // the original is decoded and the result saved as that copy, so later opens skip the decode.
+                            property bool copyBroken: false
+                            property bool copySaved: false
+                            readonly property string original: tile.modelData.url
+                            anchors.fill: parent
+                            anchors.margins: 2
+                            // Tiles just out of view preload only small copies; an original waits until its tile shows, so it can be saved.
+                            source: Math.abs(tile.distance) > 3 ? "" : tile.modelData.thumb && !copyBroken ? tile.modelData.thumb : tile.visible || !tile.modelData.thumbPath ? original : ""
+                            asynchronous: true
+                            sourceSize.width: 760
+                            cache: true
+                            sourceSize.height: 480
+                            fillMode: Image.PreserveAspectCrop
+                            opacity: status === Image.Ready ? 1 : 0
+                            Behavior on opacity { NumberAnimation { duration: Theme.enter } }
+                            function saveCopy() {
+                                if (copySaved || !tile.modelData.thumbPath || status !== Image.Ready || source.toString() !== original || !tile.visible || width <= 0)
+                                    return;
+                                copySaved = grabToImage(result => result.saveToFile(tile.modelData.thumbPath),
+                                                        Qt.size(760, Math.round(760 * height / width)));
+                            }
+                            onStatusChanged: {
+                                if (status === Image.Error && tile.modelData.thumb && !copyBroken)
+                                    copyBroken = true;
+                                else
+                                    saveCopy();
+                            }
+                            Connections {
+                                target: tile
+                                function onVisibleChanged() {
+                                    thumbnail.saveCopy();
+                                }
+                            }
+                        }
+                        C.Icon {
+                            anchors.centerIn: parent
+                            name: "palette"
+                            size: 36
+                            opacity: 0.4
+                            visible: thumbnail.status !== Image.Ready
+                        }
+                        Rectangle {
+                            anchors.bottom: parent.bottom
+                            anchors.bottomMargin: 2
+                            x: 2
+                            width: parent.width - 4
+                            height: tile.distance === 0 ? 2 : 0
+                            color: Theme.accent
+                        }
+                        MouseArea {
+                            anchors.fill: parent
+                            enabled: !root.applying
+                            onClicked: { root.selected = tile.index; root.forceActiveFocus(); }
+                            onDoubleClicked: { root.selected = tile.index; root.apply(); }
+                        }
+                    }
+                }
+            }
+            WheelHandler {
+                property double lastMove: 0
+                onWheel: event => {
+                    if (Date.now() - lastMove > 85 && event.angleDelta.y !== 0) {
+                        root.move(event.angleDelta.y < 0 ? 1 : -1);
+                        lastMove = Date.now();
+                    }
+                }
+            }
+            Rectangle {
+                anchors.centerIn: parent
+                width: Math.min(parent.width - 40, 440)
+                height: 190
+                radius: Theme.panelRadius
+                color: Theme.panel
+                visible: !root.filtered.length
+                C.EmptyState {
+                    anchors.centerIn: parent
+                    width: parent.width - 40
+                    glyph: "palette"
+                    title: root.loading ? I18n.t("Finding wallpapers…") : root.error && root.online ? I18n.t("Could not load wallpapers") : search.text ? I18n.t("No matches") : I18n.t("Your collection starts here")
+                    description: root.loading ? (root.online ? root.sourceName : I18n.t("Local collection")) : root.error && root.online ? "" : search.text ? I18n.t("No wallpapers match “") + search.text + "”" : root.online ? root.sourceName : (root.directory || "~/Pictures/Wallpapers")
+                }
+            }
+        }
+        Rectangle {
+            Layout.alignment: Qt.AlignHCenter
+            Layout.preferredWidth: Math.min(root.width, 680)
+            Layout.preferredHeight: footer.implicitHeight + 28
+            color: Theme.panel
+            radius: Theme.panelRadius
+            ColumnLayout {
+                id: footer
+                anchors.left: parent.left
+                anchors.right: parent.right
+                anchors.top: parent.top
+                anchors.margins: 14
+                spacing: Theme.gapM
+                RowLayout {
+                    Layout.fillWidth: true
+                    C.Button { glyph: "back"; hint: I18n.t("Previous wallpaper"); enabled: root.selected > 0 && !root.applying; onClicked: root.move(-1) }
+                    ColumnLayout {
+                        Layout.fillWidth: true
+                        spacing: Theme.gapXs
+                        C.Label { text: root.current ? root.current.name : I18n.t("No wallpaper selected"); font.weight: Font.DemiBold; Layout.fillWidth: true; elide: Text.ElideRight }
+                        C.Label {
+                            text: root.current ? (root.selected + 1) + " / " + root.filtered.length + (root.current.resolution ? " · " + root.current.resolution : "") + (root.online ? (root.current.path ? I18n.t(" · Saved locally") : I18n.t(" · Online")) : "") : root.online ? root.sourceName : I18n.t("Local collection")
+                            color: Theme.muted; font.pixelSize: Theme.small; Layout.fillWidth: true; elide: Text.ElideRight
+                        }
+                    }
+                    C.Button { glyph: "chevron"; hint: I18n.t("Next wallpaper"); enabled: root.selected < root.filtered.length - 1 && !root.applying; onClicked: root.move(1) }
+                    C.Button {
+                        text: ShellState.wallpaperDownloading ? I18n.t("Saving…") : ShellState.wallpaperBusy ? I18n.t("Applying…") : root.isCurrent ? I18n.t("Applied") : root.current && root.current.remote && !root.current.path ? I18n.t("Save & apply") : I18n.t("Apply")
+                        accent: !!root.current && !root.isCurrent
+                        enabled: !!root.current && !root.isCurrent && !root.applying
+                        onClicked: root.apply()
+                    }
+                }
+                C.Label {
+                    visible: (ShellState.wallpaperError || root.error) !== ""
+                    text: ShellState.wallpaperError || root.error
+                    color: ShellState.wallpaperError ? Theme.danger : Theme.warning; wrapMode: Text.WordWrap; Layout.fillWidth: true
+                }
+                RowLayout {
+                    Layout.fillWidth: true
+                    C.Label {
+                        text: !root.online && root.listedCount > 0 ? I18n.t("Showing the first ") + root.listedCount + I18n.t(" wallpapers") : ""
+                        color: Theme.muted
+                        font.pixelSize: Theme.small
+                        elide: Text.ElideRight
+                        Layout.fillWidth: true
+                    }
+                    C.Button {
+                        visible: root.sourceMode === "wallpaperscom"
+                        text: I18n.t("Wallpapers.com ↗")
+                        flat: true
+                        onClicked: ShellState.openUrl(root.current && root.current.creditUrl ? root.current.creditUrl : "https://wallpapers.com/")
+                    }
+                    C.Button {
+                        visible: root.online && root.error !== ""
+                        text: I18n.t("My wallpapers")
+                        flat: true
+                        enabled: !root.applying
+                        onClicked: root.chooseSource("local")
+                    }
+                    C.Button {
+                        visible: root.online && root.error !== ""
+                        text: I18n.t("Retry")
+                        flat: true
+                        enabled: !root.onlineLoading && !root.applying
+                        onClicked: root.searchOnline(false)
+                    }
+                    C.Button {
+                        visible: root.online && root.hasMore
+                        text: root.onlineLoading ? I18n.t("Loading…") : I18n.t("Load more")
+                        enabled: !root.onlineLoading && !root.applying
+                        flat: true
+                        onClicked: root.searchOnline(true)
+                    }
+                    C.Button { visible: !root.online; text: I18n.t("Open folder"); glyph: "grid"; flat: true; enabled: root.directory !== ""; onClicked: ShellState.openPath(root.directory) }
+                }
+            }
+        }
+    }
+    Timer {
+        id: onlineDebounce
+        interval: 500
+        onTriggered: root.searchOnline(false)
+    }
+    Keys.onLeftPressed: move(-1)
+    Keys.onRightPressed: move(1)
+    Keys.onReturnPressed: apply()
+}

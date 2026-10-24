@@ -1,0 +1,272 @@
+{
+  "identity": {
+    "name": "NEKRYPTA",
+    "language": "pt_BR",
+    "terminal": "kitty"
+  },
+  "palette": {
+    "accent": "#66cccc",
+    "surfaces": {
+      "background": "#01030d",
+      "panel": "#05081a",
+      "surface": "#13204a",
+      "raised": "#1d2662",
+      "hover": "#232a6e",
+      "border": "#424153",
+      "text": "#ffffff",
+      "muted": "#8699bf",
+      "disabled": "#6e7391"
+    },
+    "accentStrong": "#333399",
+    "status": {
+      "danger": "#db9292",
+      "success": "#a2c6ac",
+      "warning": "#d6ba86"
+    },
+    "wallpaper": {
+      "sky": "#13204a",
+      "cloud": "#8699bf",
+      "petroleum": "#66cccc",
+      "reflection": "#333399",
+      "highlight": "#ffffff"
+    },
+    "visualizer": {
+      "top": "#d6f1ff",
+      "base": "#66cccc"
+    },
+    "accentFromWallpaper": false
+  },
+  "typography": {
+    "body": 14,
+    "barText": 12,
+    "sans": "Adwaita Sans",
+    "mono": "Adwaita Mono"
+  },
+  "motion": {
+    "reduced": false
+  },
+  "bar": {
+    "style": "floating",
+    "height": 38,
+    "controlHeight": 37,
+    "iconSize": 21,
+    "hitTarget": 40,
+    "layout": {
+      "left": [
+        "launcher",
+        "workspaces",
+        "windowTitle"
+      ],
+      "center": [
+        "clock",
+        "recording"
+      ],
+      "right": [
+        "temperature",
+        "media",
+        "privacy",
+        "focus",
+        "timer",
+        "stayAwake",
+        "keyboard",
+        "wifi",
+        "audio",
+        "bluetooth",
+        "notifications",
+        "system",
+        "battery",
+        "tray",
+        "control"
+      ],
+      "hidden": []
+    },
+    "clock": {
+      "format": "date-time",
+      "seconds": true,
+      "hour24": true,
+      "weekStart": "locale"
+    },
+    "temperature": {
+      "units": "metric",
+      "location": {
+        "name": "Jacareí",
+        "region": "São Paulo, Brazil",
+        "latitude": -23.3053,
+        "longitude": -45.9658
+      }
+    },
+    "workspaces": {
+      "style": "numbers",
+      "slots": 0
+    },
+    "trayIcons": 0,
+    "batteryPercent": "always",
+    "hideFullscreen": true,
+    "hiddenOutputs": [],
+    "ambient": true,
+    "ambientStyle": "reflexo-azul",
+    "media": true,
+    "trackChangeCard": true
+  },
+  "controlCenter": {
+    "layout": {}
+  },
+  "wallpaper": {
+    "directory": "~/Pictures/Wallpapers"
+  },
+  "lock": {
+    "screen": "builtin",
+    "style": "particles"
+  },
+  "capture": {
+    "screenshotDirectory": "~/Pictures/Screenshots",
+    "recordingDirectory": "~/Videos/Recordings"
+  },
+  "security": {
+    "allowTailscaleMinecraft": true,
+    "minecraftPeer": "",
+    "mullvad": {
+      "lockdown": true,
+      "lan": "block",
+      "obfuscation": "shadowsocks",
+      "quantumResistance": true,
+      "daita": true,
+      "relays": [
+        "al",
+        "bg",
+        "hr",
+        "cy",
+        "cz",
+        "ee",
+        "fi",
+        "gr",
+        "hk",
+        "hu",
+        "id",
+        "ie",
+        "il",
+        "jp",
+        "my",
+        "ng",
+        "ph",
+        "pl",
+        "rs",
+        "sg",
+        "sk",
+        "si",
+        "za",
+        "th"
+      ]
+    }
+  },
+  "shortcuts": [
+    {
+      "keys": "SUPER + SPACE",
+      "action": "launcher",
+      "title": "Lançador"
+    },
+    {
+      "keys": "SUPER + R",
+      "action": "launcher",
+      "title": "Lançador"
+    },
+    {
+      "keys": "SUPER + V",
+      "action": "clipboard",
+      "title": "Área de transferência"
+    },
+    {
+      "keys": "SUPER + A",
+      "action": "control",
+      "title": "Central de controle"
+    },
+    {
+      "keys": "SUPER + N",
+      "action": "notifications",
+      "title": "Notificações"
+    },
+    {
+      "keys": "CTRL + SHIFT + Escape",
+      "action": "system",
+      "title": "Monitor do sistema"
+    },
+    {
+      "keys": "SUPER + M",
+      "action": "power",
+      "title": "Menu de sessão"
+    },
+    {
+      "keys": "Print",
+      "action": "screenshot region",
+      "title": "Captura de região"
+    },
+    {
+      "keys": "SUPER + L",
+      "action": "lock",
+      "title": "Bloquear a tela"
+    },
+    {
+      "keys": "SHIFT + Print",
+      "action": "screenshot output",
+      "title": "Captura da tela"
+    },
+    {
+      "keys": "SUPER + Print",
+      "action": "capture",
+      "title": "Capturar"
+    },
+    {
+      "keys": "SUPER + SHIFT + W",
+      "action": "wallpaper",
+      "title": "Papéis de parede",
+      "optIn": true
+    }
+  ],
+  "operationalDefaults": {
+    "dnd": false,
+    "amplification": false,
+    "persistNotifications": false,
+    "eqEnabled": false,
+    "eqPreset": "flat",
+    "mediaRemaining": false,
+    "searchEngine": "duckduckgo",
+    "recordAudio": "none",
+    "systemWindow": 300,
+    "focusMinutes": 25,
+    "visualizer": false,
+    "captureDelay": 0
+  },
+  "bindings": {
+    "language": "identity.language",
+    "terminal": "identity.terminal",
+    "reducedMotion": "motion.reduced",
+    "fontSize": "typography.body",
+    "accentColor": "palette.accent",
+    "accentFromWallpaper": "palette.accentFromWallpaper",
+    "barStyle": "bar.style",
+    "barLayout": "bar.layout",
+    "controlLayout": "controlCenter.layout",
+    "clockFormat": "bar.clock.format",
+    "clockSeconds": "bar.clock.seconds",
+    "clock24h": "bar.clock.hour24",
+    "weekStart": "bar.clock.weekStart",
+    "weatherUnits": "bar.temperature.units",
+    "weatherLocation": "bar.temperature.location",
+    "workspaceStyle": "bar.workspaces.style",
+    "workspaceSlots": "bar.workspaces.slots",
+    "trayIcons": "bar.trayIcons",
+    "batteryPercent": "bar.batteryPercent",
+    "hideFullscreen": "bar.hideFullscreen",
+    "hiddenOutputs": "bar.hiddenOutputs",
+    "barAmbient": "bar.ambient",
+    "barAmbientStyle": "bar.ambientStyle",
+    "barMedia": "bar.media",
+    "trackChangeCard": "bar.trackChangeCard",
+    "lockScreen": "lock.screen",
+    "lockStyle": "lock.style",
+    "screenshotDirectory": "capture.screenshotDirectory",
+    "recordingDirectory": "capture.recordingDirectory",
+    "wallpaperDirectory": "wallpaper.directory",
+    "allowTailscaleMinecraft": "security.allowTailscaleMinecraft"
+  }
+}

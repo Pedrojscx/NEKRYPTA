@@ -1,0 +1,130 @@
+pragma Singleton
+import QtQuick
+import Quickshell.Io
+import "paths.js" as Paths
+import "i18n.js" as I18n
+
+QtObject {
+    id: root
+    property bool ready: false
+    property int sequence: 0
+    property var pending: ({})
+    property var capabilities: ({})
+    function refreshCapabilities() {
+        request("capabilities", {}, (result, error) => {
+            if (!error)
+                capabilities = result;
+        });
+    }
+    // Whether a helper command is installed; `assumed` answers until the helper has reported.
+    function has(command, assumed) {
+        const commands = capabilities.commands;
+        return commands ? commands[command] === true : assumed === true;
+    }
+    property string lastError: ""
+    signal eventReceived(string name, var data)
+    function request(method, params, callback) {
+        if (!ready) {
+            if (callback)
+                callback(null, {
+                    code: "unavailable",
+                    message: I18n.t("Desktop helper is not running")
+                });
+            return;
+        }
+        const id = ++sequence;
+        pending[id] = {
+            callback: callback,
+            method: method,
+            time: Date.now()
+        };
+
+        process.write(JSON.stringify({
+            id: id,
+            method: method,
+            params: params || {}
+        }) + "\n");
+    }
+    function receive(line) {
+        try {
+            const msg = JSON.parse(line);
+            if (msg.event) {
+                eventReceived(msg.event, msg.data);
+                return;
+            }
+            const item = pending[msg.id];
+            delete pending[msg.id];
+            if (!msg.ok && msg.error && msg.error.code !== "cancelled" && (!item || ["calculator", "units.convert", "files.search", "weather.get", "wallhaven.search", "wallpaperscom.search", "media.art", "system.sample"].indexOf(item.method) < 0)) {
+                lastError = I18n.error(msg.error);
+            }
+            if (item && item.callback) {
+                // A callback whose panel closed meanwhile throws a ReferenceError: that is no bad response.
+                try {
+                    item.callback(msg.result, msg.ok ? null : msg.error);
+                } catch (e) {
+                    console.warn("Desktop helper callback for", item.method, "failed:", e);
+                }
+            }
+        } catch (e) {
+            lastError = I18n.t("Invalid response from desktop helper");
+        }
+    }
+    property Process process: Process {
+        command: ["python3", Paths.localPath(Qt.resolvedUrl("../helpers/backend.py"))]
+        stdinEnabled: true
+        running: true
+        stdout: SplitParser {
+            onRead: data => root.receive(data)
+        }
+        // The helper reports sanitized errors over its structured protocol.
+        stderr: SplitParser {
+            onRead: data => {
+                if (data)
+                    console.warn("Desktop helper:", data);
+            }
+        }
+        onStarted: {
+            root.ready = true;
+            // A notice about the previous helper stopping no longer applies.
+            root.lastError = "";
+            root.refreshCapabilities();
+        }
+        onExited: {
+            root.ready = false;
+            const old = root.pending;
+            root.pending = {};
+
+            // ShellState shows one notice for the restart; callers see "stopped" and stay quiet.
+            root.lastError = I18n.t("Desktop helper stopped; restarting");
+            for (const key in old)
+                if (old[key].callback)
+                    old[key].callback(null, {
+                        code: "stopped",
+                        message: I18n.t("Desktop helper stopped")
+                    });
+            root.restart.restart();
+        }
+    }
+    property Timer restart: Timer {
+        interval: 5000
+        onTriggered: root.process.running = true
+    }
+    property Timer deadlines: Timer {
+        interval: 10000
+        running: root.ready
+        repeat: true
+        onTriggered: {
+            const now = Date.now();
+            for (const key in root.pending) {
+                if (now - root.pending[key].time > 180000) {
+                    const cb = root.pending[key].callback;
+                    delete root.pending[key];
+                    if (cb)
+                        cb(null, {
+                            message: I18n.t("Operation timed out")
+                        });
+                }
+            }
+        }
+    }
+}

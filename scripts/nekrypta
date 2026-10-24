@@ -1,0 +1,132 @@
+#!/bin/sh
+set -eu
+config="$HOME/.config/quickshell/nekrypta"
+version() {
+  v=
+  [ -r "$config/COMMIT" ] && read -r v < "$config/COMMIT" || true
+  case "$v" in ''|*[!0-9A-Za-z.+~-]*) v=unknown ;; esac
+  echo "$v"
+}
+label=${3:-}
+set -- "${1:-launcher}" "${2:-}"
+case "$1" in
+  start)
+    # The whole session environment, so apps launched from NEKRYPTA see PATH, $TERMINAL, themes and
+    # cursors set in hyprland.lua, not just the variables a systemd user service starts with.
+    dbus-update-activation-environment --systemd --all
+    systemctl --user daemon-reload
+    # Apps need a polkit agent to ask for passwords; start Hyprland's if no other agent runs.
+    if systemctl --user cat hyprpolkitagent.service >/dev/null 2>&1 \
+        && ! pgrep -u "$(id -u)" -f 'polkit-(gnome|kde|mate)|hyprpolkitagent|lxpolkit|polkit-agent' >/dev/null; then
+      systemctl --user start hyprpolkitagent.service || true
+    fi
+    # Keep an existing idle policy, whether it runs as a process or as a (not yet started) service. Only this user's
+    # processes count: another account's hypridle (or a process it names so) must not stop the screen from locking.
+    if command -v hypridle >/dev/null && ! pgrep -u "$(id -u)" -x hypridle >/dev/null \
+        && ! systemctl --user is-active --quiet hypridle.service && ! systemctl --user is-enabled --quiet hypridle.service 2>/dev/null; then
+      hypridle --config "$HOME/.config/hypr/nekrypta-hypridle.conf" >/dev/null 2>&1 &
+    fi
+    # A crash loop leaves the unit failed with its start limit hit, which would refuse this start.
+    systemctl --user reset-failed nekrypta.service 2>/dev/null || true
+    exec systemctl --user start nekrypta.service
+    ;;
+  run)
+    # What nekrypta.service runs. glvnd loads NVIDIA's EGL and GLX drivers as well as Mesa's, so on a hybrid
+    # laptop the shell would carry about 50 MB of NVIDIA driver while drawing on the integrated GPU. Use
+    # Mesa alone when the GPU Hyprland renders on is a Mesa one; never otherwise, where it would mean
+    # software rendering. NEKRYPTA_CHILD_UNSET names what was set here, so apps the shell launches (prime-run,
+    # games) don't inherit it: ShellState.launch() removes it again.
+    sysfs=${NEKRYPTA_SYSFS:-/sys} vendors=${NEKRYPTA_EGL_VENDORS:-/usr/share/glvnd/egl_vendor.d}
+    if [ -z "${__EGL_VENDOR_LIBRARY_FILENAMES:-}${__EGL_VENDOR_LIBRARY_DIRS:-}" ] \
+        && [ -r "$vendors/10_nvidia.json" ] && [ -r "$vendors/50_mesa.json" ]; then
+      # Hyprland renders on the first of AQ_DRM_DEVICES when it is set, otherwise on the boot GPU.
+      card=
+      if [ -n "${AQ_DRM_DEVICES:-}" ]; then
+        node=$(readlink -f "${AQ_DRM_DEVICES%%:*}") || node=
+        [ -n "$node" ] && card=$sysfs/class/drm/${node##*/}
+      else
+        for vga in "$sysfs"/class/drm/card*/device/boot_vga; do
+          read -r boot < "$vga" 2>/dev/null || continue
+          if [ "$boot" = 1 ]; then card=${vga%/device/boot_vga}; break; fi
+        done
+      fi
+      driver=$(readlink -f "$card/device/driver" 2>/dev/null) || driver=
+      case ${card:+${driver##*/}} in
+        i915|xe|amdgpu|radeon|nouveau)
+          export __EGL_VENDOR_LIBRARY_FILENAMES="$vendors/50_mesa.json" NEKRYPTA_CHILD_UNSET=__EGL_VENDOR_LIBRARY_FILENAMES
+          if [ -z "${__GLX_VENDOR_LIBRARY_NAME:-}" ]; then
+            export __GLX_VENDOR_LIBRARY_NAME=mesa NEKRYPTA_CHILD_UNSET="$NEKRYPTA_CHILD_UNSET __GLX_VENDOR_LIBRARY_NAME"
+          fi
+          ;;
+      esac
+    fi
+    exec quickshell --path "$config" --no-duplicate
+    ;;
+  stop) exec systemctl --user stop nekrypta.service ;;
+  restart)
+    # An update may have changed the unit.
+    systemctl --user daemon-reload
+    systemctl --user reset-failed nekrypta.service 2>/dev/null || true
+    exec systemctl --user restart nekrypta.service
+    ;;
+  logs) exec journalctl --user -u nekrypta.service -n 80 --no-pager ;;
+  close) exec quickshell ipc -p "$config" call shell close ;;
+  lock)
+    exec "$config/scripts/session-action" lock
+    ;;
+  screenshot)
+    case "${2:-region}" in
+      region|output) exec quickshell ipc -p "$config" call shell action "screenshot-${2:-region}" ;;
+      *) echo 'Usage: nekrypta screenshot [region|output]' >&2; exit 2 ;;
+    esac
+    ;;
+    page)
+    case "$2" in
+      wifi|bluetooth|audio|power|media|tray) exec quickshell ipc -p "$config" call shell page "$2" ;;
+      *) echo 'Usage: nekrypta page {wifi|bluetooth|audio|power|media|tray}' >&2; exit 2 ;;
+    esac
+    ;;
+  focus)
+    case "$2" in
+      ''|start) exec quickshell ipc -p "$config" call focus start 0 ;;
+      toggle) exec quickshell ipc -p "$config" call focus toggle ;;
+      end|stop) exec quickshell ipc -p "$config" call focus end ;;
+      status) exec quickshell ipc -p "$config" call focus status ;;
+      [1-9]|[1-9][0-9]|[1-9][0-9][0-9])
+        [ "$2" -le 240 ] && exec quickshell ipc -p "$config" call focus start "$2"
+        echo 'Focus sessions last 1 to 240 minutes' >&2; exit 2 ;;
+      *) echo 'Usage: nekrypta focus [MINUTES|toggle|end|status]' >&2; exit 2 ;;
+    esac
+    ;;
+  timer)
+    # 90 or 90s is seconds, 10m minutes, 1h hours; an optional label follows.
+    amount=${2%[smh]}
+    case "$amount" in ''|*[!0-9]*|0*) echo 'Usage: nekrypta timer DURATION[s|m|h] [LABEL]' >&2; exit 2 ;; esac
+    [ ${#amount} -le 5 ] || { echo 'Timers last up to 24 hours' >&2; exit 2; }
+    case "$2" in *m) amount=$((amount * 60)) ;; *h) amount=$((amount * 3600)) ;; esac
+    [ "$amount" -le 86400 ] || { echo 'Timers last up to 24 hours' >&2; exit 2; }
+    exec quickshell ipc -p "$config" call focus timer "$amount" "$label"
+    ;;
+  color) exec quickshell ipc -p "$config" call shell action color ;;
+  dnd)
+    case "${2:-toggle}" in
+      on|off|toggle) exec quickshell ipc -p "$config" call shell dnd "${2:-toggle}" ;;
+      *) echo 'Usage: nekrypta dnd [on|off|toggle]' >&2; exit 2 ;;
+    esac
+    ;;
+  stop-recording) exec quickshell ipc -p "$config" call shell action stop-recording ;;
+  status)
+    state=$(quickshell ipc -p "$config" call shell status)
+    case "$state" in
+      '{}') printf '{"version":"%s"}\n' "$(version)" ;;
+      '{'*) printf '{"version":"%s",%s\n' "$(version)" "${state#?}" ;;
+      *) printf '%s\n' "$state" ;;
+    esac
+    ;;
+  --version|version) echo "NEKRYPTA $(version)" ;;
+  launcher|clipboard|control|notifications|capture|power|calendar|wallpaper|system)
+    exec quickshell ipc -p "$config" call shell toggle "$1"
+    ;;
+  help|-h|--help) echo 'Usage: nekrypta {start|stop|restart|logs|close|lock|launcher|clipboard|control|notifications|capture|power|calendar|wallpaper|system|screenshot [region|output]|page PAGE|focus [MINUTES|toggle|end]|timer DURATION [LABEL]|color|dnd [on|off]|stop-recording|status|--version}' ;;
+  *) echo 'Usage: nekrypta {start|stop|restart|logs|close|lock|launcher|clipboard|control|notifications|capture|power|calendar|wallpaper|system|screenshot [region|output]|page PAGE|focus [MINUTES|toggle|end]|timer DURATION [LABEL]|color|dnd [on|off]|stop-recording|status|--version}' >&2; exit 2 ;;
+esac

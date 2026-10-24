@@ -1,0 +1,99 @@
+import QtQuick
+import Quickshell
+import Quickshell.Wayland
+import Quickshell.Io
+import "../core"
+import "../components" as C
+
+PanelWindow {
+    id: bar
+    required property string outputName
+    readonly property bool edge: ShellState.setting("barStyle", "floating") === "edge"
+    IpcHandler {
+        target: "bar-" + bar.outputName
+        function status(): string {
+            return JSON.stringify({control: content.controlActive(""), network: content.controlActive("network"), audio: content.controlActive("audio"), power: content.controlActive("power"), media: content.controlActive("media"), tray: content.controlActive("tray")});
+        }
+    }
+    anchors {
+        top: true
+        left: true
+        right: true
+    }
+    margins {
+        top: bar.edge ? 0 : 5
+        left: bar.edge ? 0 : 8
+        right: bar.edge ? 0 : 8
+    }
+    implicitHeight: Theme.barHeight
+    color: "transparent"
+    WlrLayershell.namespace: "nekrypta-bar"
+    WlrLayershell.layer: WlrLayer.Top
+    exclusionMode: ExclusionMode.Auto
+    // Stays mapped under the lock screen: unmapping would hand its space to the windows, and they would all
+    // shrink back into place as the session unlocks.
+    visible: !(ShellState.setting("hideFullscreen", true) && content.monitor && content.monitor.hasFullscreen) && ShellState.setting("hiddenOutputs", []).indexOf(bar.outputName) < 0
+    BarContent {
+        id: content
+        anchors.fill: parent
+        outputName: bar.outputName
+        window: bar
+        tooltip: barTooltip
+        trayMenu: trayMenu
+        onScreen: bar.visible && !ShellState.locked
+        opacity: bar.arrival
+        transform: Translate { y: -(1 - bar.arrival) * 14 }
+    }
+    // Lifts away as the desktop folds into the lock screen, and drops back in just behind the reveal after an unlock.
+    property real arrival: 1
+    Component.onCompleted: arrival = ShellState.locked ? 0 : 1
+    Connections {
+        target: ShellState
+        function onLockedChanged() {
+            arrive.stop();
+            leave.stop();
+            if (ShellState.locked) {
+                leave.restart();
+            } else {
+                bar.arrival = 0;
+                arrive.restart();
+            }
+        }
+    }
+    NumberAnimation {
+        id: leave
+        target: bar
+        property: "arrival"
+        to: 0
+        duration: Theme.reduced ? 0 : 240
+        easing.type: Easing.InCubic
+    }
+    SequentialAnimation {
+        id: arrive
+        PauseAnimation { duration: Theme.reduced ? 0 : 180 }
+        NumberAnimation {
+            target: bar
+            property: "arrival"
+            to: 1
+            duration: Theme.reduced ? 0 : 420
+            easing.type: Easing.OutCubic
+        }
+    }
+    TrayMenu {
+        id: trayMenu
+    }
+    C.Tooltip {
+        id: barTooltip
+        anchor.window: bar
+    }
+    Item {
+        id: mediaFallback
+        width: 1
+        height: 1
+    }
+    MediaHoverCard {
+        bar: bar
+        button: content.mediaButton || mediaFallback
+        buttonHovered: content.mediaHovered && !!content.mediaButton && content.mediaButton.visible && bar.visible
+    }
+}
